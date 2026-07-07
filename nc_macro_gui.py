@@ -393,25 +393,37 @@ def detect_hp_bar_fill(hwnd, band_frac, hue_lo, hue_hi,
         while y1 < h - 1 and fill_rows[y1 + 1] >= thr:
             y1 += 1
 
-        # Horizontal: within the bar's rows, the full bar is the widest run of
-        # columns that are mostly (fill|track). Filled columns within it give HP%.
-        bar_band = bar[y0:y1 + 1, :]
+        # Horizontal (fill-anchored, robust to text overlaid on the bar):
+        #   left edge  = leftmost red column (bars fill from the left)
+        #   fill edge  = RIGHTMOST red column — ignores dark HP digits punched into
+        #                the middle of the fill, since red resumes after them
+        #   right end  = extend from the fill edge through the contiguous dark track
         fill_band = fill[y0:y1 + 1, :]
-        col_is_bar = bar_band.mean(axis=0) > 0.5
-        x0, bar_len = _widest_true_run(col_is_bar)
-        if bar_len < min_bar_frac * w:
-            return None
-        x1 = x0 + bar_len - 1
+        track_band = track[y0:y1 + 1, :]
+        fill_col = fill_band.mean(axis=0) > 0.15   # a column has meaningful red
+        track_col = track_band.mean(axis=0) > 0.5
 
-        fill_cols = int((fill_band[:, x0:x1 + 1].mean(axis=0) > 0.5).sum())
-        hp = 100.0 * float(fill_cols) / float(bar_len)
+        fill_idx = np.flatnonzero(fill_col)
+        if fill_idx.size < min_bar_frac * w:
+            return None  # too little red to be the HP bar
+        bar_left = int(fill_idx[0])
+        fill_right = int(fill_idx[-1])
+
+        x1 = fill_right
+        while x1 + 1 < w and track_col[x1 + 1]:
+            x1 += 1
+
+        total = x1 - bar_left + 1
+        filled = fill_right - bar_left + 1
+        hp = max(0.0, min(100.0, 100.0 * float(filled) / float(total)))
 
         if save_debug:
             vis = np.zeros((h, w, 3), dtype=np.uint8)
             vis[track] = (60, 60, 60)
             vis[fill] = (220, 30, 30)
-            vis[y0:y1 + 1, x0] = (0, 255, 0)   # detected bar left edge
-            vis[y0:y1 + 1, x1] = (0, 255, 0)   # detected bar right edge
+            vis[y0:y1 + 1, bar_left] = (0, 255, 0)     # bar left edge
+            vis[y0:y1 + 1, fill_right] = (255, 255, 0)  # fill edge (HP level)
+            vis[y0:y1 + 1, x1] = (0, 255, 0)            # bar right end
             Image.fromarray(vis, "RGB").save("debug_hp_fill.png")
 
         return hp
@@ -787,12 +799,11 @@ class MacroGUI:
             messagebox.showerror("Error", "Health hue lo/hi must be integers (0-255).")
             return
         hp = detect_hp_bar_fill(hwnd, band, hue[0], hue[1], save_debug=True)
+        legend = "(debug_hp_fill.png: red=fill, grey=track, green=bar ends, yellow=HP level)"
         if hp is None:
-            print("[TEST] No HP bar found — check band/hue. See debug_hp_fill.png "
-                  "(red = detected fill, grey = track, green lines = bar edges).")
+            print(f"[TEST] No HP bar found — check band/hue. {legend}")
         else:
-            print(f"[TEST] Self HP ~ {hp:.1f}%  (saved debug_hp_fill.png: red=fill, "
-                  "grey=track, green=bar edges)")
+            print(f"[TEST] Self HP ~ {hp:.1f}%  {legend}")
 
     def poll_log_queue(self):
         """Drain queued console output into the log panel. Runs on the Tk main

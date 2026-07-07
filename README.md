@@ -1,6 +1,6 @@
-# Night Crows Cleric — Auto Healer
+# Revolt — Night Crows Cleric BOT
 
-A Tkinter-based helper for the Cleric (support) playstyle in Night Crows Global.
+A Tkinter-based bot for the Cleric (support) playstyle in Night Crows Global.
 It reads HP bars off the screen and reactively heals you and your party, plus timed
 buffs and anti-AFK — all against a selected game window, with an in-app debug log.
 
@@ -18,9 +18,7 @@ buffs and anti-AFK — all against a selected game window, with an in-app debug 
 - **HP detection by color-fill** — instead of fragile OCR, HP is measured from the
   vivid-red fill of the bar within a resolution-independent (fractional) band, so
   calibration survives window resizing.
-- **Heal priority** — self-panic → party-panic → self-heal → party-heal → rotation.
-- **Rotational healing** (legacy) — cycles heals across F1–F4 and optionally self on
-  a fixed cooldown; used as a fallback when reactive party healing is off.
+- **Heal priority** — self-panic → party-panic → self-heal → party-heal.
 - **Timed buffs** — presses configured hotbar keys on an interval.
 - **Anti-AFK** — random WASD movement, safe-key presses, or disabled.
 - **Power-saver detection** — wakes a dimmed game window before casting.
@@ -54,7 +52,7 @@ python nc_macro_gui.py
 pyinstaller nc_macro_gui.spec
 ```
 
-The built app is written to `dist\nc_macro_gui.exe` (windowed — no console).
+The built app is written to `dist\Revolt.exe` (windowed — no console).
 
 ## Calibrating HP detection
 

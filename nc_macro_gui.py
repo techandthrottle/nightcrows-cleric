@@ -112,13 +112,6 @@ CAST_DELAY        = 0.8
 
 HEAL_VK = ord("2")
 
-# Special VK for self-heal in rotation
-VK_SELF_IN_ROTATION = win32con.VK_ESCAPE # Using ESC to target self
-
-# These will be dynamic based on GUI checkboxes
-PARTY_VK_DEFAULT    = [win32con.VK_F1, win32con.VK_F2, win32con.VK_F3, win32con.VK_F4]
-PARTY_NAMES_DEFAULT = ["F1", "F2", "F3", "F4"]
-
 BUFF_HOTBAR_KEYS = [ord('5'), ord('6'), ord('7'), ord('8')]
 
 POWER_SAVER_BRIGHTNESS_THRESHOLD = 30
@@ -160,10 +153,6 @@ running       = False
 last_buff_press_time = time.time() # Initialize timer for buff presses
 BUFF_INTERVAL = 5 * 60 # 5 minutes in seconds
 
-
-party_index   = 0
-party_heals_enabled = False # Default to False for GUI
-selected_party_members_vk = [] # To be populated by GUI
 
 def find_game_window(game_window_title_param):
     return win32gui.FindWindow(None, game_window_title_param)
@@ -500,8 +489,6 @@ def healer_loop(
     heal_cooldown_param,
     cast_delay_param,
     heal_vk_param,
-    party_heals_enabled_param,
-    selected_party_members_vk_param,
     game_window_title_param,
     anti_afk_mode_param="movement",
     safe_afk_keys_param=None,
@@ -522,7 +509,7 @@ def healer_loop(
     party_red_min_param=PARTY_RED_MIN,
     party_red_margin_param=PARTY_RED_MARGIN,
 ):
-    global running, party_index
+    global running
     previous_target_vk = None
     last_buff_press_time = time.time()
     last_self_heal_time = 0.0
@@ -534,8 +521,6 @@ def healer_loop(
         print("[HEALER_LOOP] Game window not found at start. Stopping.")
         return
 
-    print(f"        Party Heals: {'ON' if party_heals_enabled_param else 'OFF'}")
-    print(f"        Selected Party VKs: {selected_party_members_vk_param}")
     print(f"        Buffs: {'ON' if buff_enabled_param else 'OFF'}  Keys: {buff_keys_param}  Interval: {buff_interval_param}s")
     if reactive_enabled_param:
         print(f"        Reactive Self-Heal: ON  Heal<={self_heal_threshold_param:.0f}%  Panic<={self_panic_threshold_param:.0f}%")
@@ -582,8 +567,9 @@ def healer_loop(
         now = time.time()
 
         def _self_heal(tag):
-            # Ensure the heal lands on self, not a lingering party target.
-            if previous_target_vk is not None and previous_target_vk != VK_SELF_IN_ROTATION:
+            # Ensure the heal lands on self, not a lingering party target: pressing
+            # the party key again toggles (deselects) it, so the heal self-casts.
+            if previous_target_vk is not None:
                 print(f"[REACTIVE] Deselecting party target (VK {previous_target_vk}) before self-heal.")
                 _send_vk(hwnd, previous_target_vk)
                 time.sleep(0.1)
@@ -647,43 +633,6 @@ def healer_loop(
             else:
                 _do_anti_afk(hwnd, anti_afk_mode_param, safe_afk_keys_param)
                 time.sleep(0.5)
-        elif party_heals_enabled_param and selected_party_members_vk_param:
-            current_target_vk = selected_party_members_vk_param[party_index]
-
-            if current_target_vk == VK_SELF_IN_ROTATION:
-                # Re-press the previous party key to toggle (deselect) that target,
-                # so the next heal lands on self. Safer than ESC which can open the menu.
-                if previous_target_vk is not None and previous_target_vk != VK_SELF_IN_ROTATION:
-                    print(f"[HEALER_LOOP] Deselecting party target by re-pressing VK {previous_target_vk}.")
-                    _send_vk(hwnd, previous_target_vk)
-                    time.sleep(0.1)
-                else:
-                    print("[HEALER_LOOP] No active party target — healing Self directly.")
-                cast_heal(hwnd, heal_vk_param, cast_delay_param)
-            else:
-                # Only send the target key if it's a new target
-                if current_target_vk != previous_target_vk:
-                    print(f"[HEALER_LOOP] Targeting Party member (VK: {current_target_vk}).")
-                    _send_vk(hwnd, current_target_vk)
-                    time.sleep(0.2)
-                else:
-                    print(f"[HEALER_LOOP] Target (VK: {current_target_vk}) already selected. Skipping target key press.")
-                cast_heal(hwnd, heal_vk_param, cast_delay_param)
-            
-            previous_target_vk = current_target_vk # Update previous_target_vk
-            party_index = (party_index + 1) % len(selected_party_members_vk_param)
-            
-            print(f"[HEALER_LOOP] Party heal sent. Next target index: {party_index}.")
-            
-            cooldown_end = time.time() + heal_cooldown_param
-            print(f"[HEALER_LOOP] Entering party heal cooldown for {heal_cooldown_param}s.")
-            while time.time() < cooldown_end:
-                if stop_event.is_set(): 
-                    print("[HEALER_LOOP] Stop event set during cooldown.")
-                    break
-                
-                _do_anti_afk(hwnd, anti_afk_mode_param, safe_afk_keys_param)
-                time.sleep(0.5)
         else:
             _do_anti_afk(hwnd, anti_afk_mode_param, safe_afk_keys_param)
             time.sleep(0.5)
@@ -698,20 +647,18 @@ def healer_loop(
 class MacroGUI:
     def __init__(self, master):
         self.master = master
-        master.title("Night Crows Auto Healer")
+        master.title("Revolt - Night Crows Cleric BOT")
 
         self.running_thread = None
 
         # Variables for GUI elements
         self.game_window_title_var = tk.StringVar() # New variable for selected game window
-        self.party_heals_enabled_var = tk.BooleanVar(value=False)
         self.f_keys_vars = {
             "F1": tk.BooleanVar(value=False),
             "F2": tk.BooleanVar(value=False),
             "F3": tk.BooleanVar(value=False),
             "F4": tk.BooleanVar(value=False)
         }
-        self.self_heal_in_rotation_var = tk.BooleanVar(value=False) # New variable for self-heal in rotation
         self.party_reactive_enabled_var = tk.BooleanVar(value=False) # Reactive (HP-based) party healing
         self.party_size_var = tk.StringVar(value="1")  # bars shown = party size minus self
         self.party_heal_threshold_var = tk.StringVar(value=str(PARTY_HEAL_THRESHOLD))
@@ -776,24 +723,14 @@ class MacroGUI:
         party_frame = ttk.LabelFrame(self.master, text="Party Heal Settings")
         party_frame.pack(padx=10, pady=5, fill="x")
 
-        ttk.Checkbutton(
-            party_frame,
-            text="Enable Party Heals",
-            variable=self.party_heals_enabled_var,
-            command=self.toggle_party_heals
-        ).pack(anchor="w", padx=5, pady=2)
-
         f_keys_frame = ttk.Frame(party_frame)
         f_keys_frame.pack(anchor="w", padx=5, pady=2)
-        ttk.Label(f_keys_frame, text="Party Members (F-keys):").pack(side="left")
+        ttk.Label(f_keys_frame, text="Members to heal (F-keys, left→right):").pack(side="left")
         for text, var in self.f_keys_vars.items():
             ttk.Checkbutton(f_keys_frame, text=text, variable=var).pack(side="left", padx=2)
-        
-        # New checkbox for self-heal in rotation
-        ttk.Checkbutton(f_keys_frame, text="Self", variable=self.self_heal_in_rotation_var).pack(side="left", padx=2)
 
         # Reactive party heal: read the selected members' HP bars and heal the
-        # lowest below threshold, instead of the blind rotation.
+        # lowest below threshold.
         reactive_party_frame = ttk.Frame(party_frame)
         reactive_party_frame.pack(anchor="w", padx=5, pady=2)
         ttk.Checkbutton(
@@ -1049,9 +986,7 @@ class MacroGUI:
         """Collect all GUI settings into a plain dict for JSON persistence."""
         return {
             "game_window_title": self.game_window_title_var.get(),
-            "party_heals_enabled": self.party_heals_enabled_var.get(),
             "f_keys": {k: v.get() for k, v in self.f_keys_vars.items()},
-            "self_heal_in_rotation": self.self_heal_in_rotation_var.get(),
             "party_reactive_enabled": self.party_reactive_enabled_var.get(),
             "party_size": self.party_size_var.get(),
             "party_heal_threshold": self.party_heal_threshold_var.get(),
@@ -1080,11 +1015,9 @@ class MacroGUI:
             if key in d and d[key] is not None:
                 var.set(d[key])
         setvar(self.game_window_title_var, "game_window_title")
-        setvar(self.party_heals_enabled_var, "party_heals_enabled")
         for k, v in (d.get("f_keys") or {}).items():
             if k in self.f_keys_vars:
                 self.f_keys_vars[k].set(v)
-        setvar(self.self_heal_in_rotation_var, "self_heal_in_rotation")
         setvar(self.party_reactive_enabled_var, "party_reactive_enabled")
         setvar(self.party_size_var, "party_size")
         setvar(self.party_heal_threshold_var, "party_heal_threshold")
@@ -1151,7 +1084,7 @@ class MacroGUI:
             messagebox.showwarning("No Windows Found", "No 'NIGHT CROWS' windows detected. Please ensure the game is running.")
 
     def start_script(self):
-        global running, stop_event, party_index
+        global running, stop_event
 
         if running:
             messagebox.showinfo("Info", "Script is already running.")
@@ -1175,15 +1108,6 @@ class MacroGUI:
             messagebox.showerror("Input Error", f"Invalid input: {e}")
             return
 
-        selected_party_members_vk = []
-        for key_name, var in self.f_keys_vars.items():
-            if var.get():
-                # Convert F-key string to VK code
-                if key_name == "F1": selected_party_members_vk.append(win32con.VK_F1)
-                elif key_name == "F2": selected_party_members_vk.append(win32con.VK_F2)
-                elif key_name == "F3": selected_party_members_vk.append(win32con.VK_F3)
-                elif key_name == "F4": selected_party_members_vk.append(win32con.VK_F4)
-
         # Party members to heal reactively, as (slot_index, vk): slot 0 = leftmost
         # bar = F1, slot 1 = F2, etc. Independent of the party's total size.
         party_members = []
@@ -1192,22 +1116,6 @@ class MacroGUI:
         for _name, _slot, _vk in _f_slot_vk:
             if self.f_keys_vars[_name].get():
                 party_members.append((_slot, _vk))
-
-        print(f"DEBUG: self_heal_in_rotation_var (before building VK list): {self.self_heal_in_rotation_var.get()}")
-        # Add self to rotation if checked
-        if self.self_heal_in_rotation_var.get():
-            selected_party_members_vk.append(VK_SELF_IN_ROTATION)
-
-        # If party heals are disabled, clear the selected party members list
-        if not self.party_heals_enabled_var.get():
-            selected_party_members_vk = []
-
-        if self.party_heals_enabled_var.get() and not selected_party_members_vk:
-            messagebox.showwarning("Warning", "Party heals enabled but no party members or self selected for rotation.")
-            # Optionally, disable party heals or force selection
-
-        print(f"DEBUG: self_heal_in_rotation_var: {self.self_heal_in_rotation_var.get()}")
-        print(f"DEBUG: selected_party_members_vk: {selected_party_members_vk}")
 
         safe_afk_keys = parse_safe_afk_keys(self.safe_afk_keys_var.get())
         if self.anti_afk_mode_var.get() == "keypress" and not safe_afk_keys:
@@ -1287,7 +1195,6 @@ class MacroGUI:
 
         stop_event.clear()
         running = True
-        party_index = 0 # Reset party index on start
 
         self.start_button.config(state="disabled")
         self.stop_button.config(state="normal")
@@ -1299,8 +1206,6 @@ class MacroGUI:
                 heal_cooldown,
                 cast_delay,
                 heal_vk,
-                self.party_heals_enabled_var.get(),
-                selected_party_members_vk,
                 game_window_title,
                 self.anti_afk_mode_var.get(),
                 safe_afk_keys,
@@ -1337,11 +1242,6 @@ class MacroGUI:
         self.start_button.config(state="normal")
         self.stop_button.config(state="disabled")
         print("Script stopped.")
-
-    def toggle_party_heals(*args):
-        # This function is called when the "Enable Party Heals" checkbox is toggled
-        # The state is automatically updated in self.party_heals_enabled_var
-        pass # No explicit action needed here, the variable holds the state
 
 def main_gui():
     root = tk.Tk()

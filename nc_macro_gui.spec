@@ -22,7 +22,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='nc_macro_gui',
+    name='Revolt',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

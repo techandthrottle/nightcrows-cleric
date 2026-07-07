@@ -74,18 +74,13 @@ HP_REGION_RELATIVE = (60, 945, 250, 970)
 # area: (left, top, right, bottom). Because it is relative, calibration survives
 # window resizing. It only needs to loosely contain the HP bar.
 HP_SEARCH_BAND_FRAC = (0.03, 0.90, 0.30, 0.99)
-# Health-fill color on PIL's 0-255 HSV Hue scale. If LO > HI the range wraps past
-# 255→0 (red sits near hue 0). Only the color is tuned — the bar is auto-located.
-HP_FILL_HUE_LO  = 240
-HP_FILL_HUE_HI  = 12
-HP_FILL_SAT_MIN = 80
-HP_FILL_VAL_MIN = 60
-# The drained/empty part of the bar: a dark, desaturated "track". Detecting it lets
-# us measure the bar's full width, so fill% = filled / (filled + empty).
-HP_TRACK_SAT_MAX = 70
-HP_TRACK_VAL_MAX = 110
+# HP fill is bright RED (red channel clearly dominant); the empty part is dark/black.
+# Detected by RGB (not hue) so it also ignores the blue mana bar. Values are 0-255.
+HP_RED_MIN    = 80    # a "filled" pixel needs at least this much red
+HP_RED_MARGIN = 30    # ...and red must exceed green AND blue by at least this much
+HP_DARK_MAX   = 70    # a pixel is "empty/track" if R, G and B are all <= this
 # The detected bar must span at least this fraction of the search-band width.
-HP_MIN_BAR_FRAC = 0.25
+HP_MIN_BAR_FRAC = 0.15
 # Heal self when HP drops to/below this percent (respects the heal cooldown).
 SELF_HEAL_THRESHOLD  = 70.0
 # Emergency: heal self immediately, jumping the party rotation, at/below this percent.
@@ -344,92 +339,142 @@ def _widest_true_run(flags):
     return best_start, best_len
 
 
-def detect_hp_bar_fill(hwnd, band_frac, hue_lo, hue_hi,
-                       fill_sat_min=HP_FILL_SAT_MIN, fill_val_min=HP_FILL_VAL_MIN,
-                       track_sat_max=HP_TRACK_SAT_MAX, track_val_max=HP_TRACK_VAL_MAX,
-                       min_bar_frac=HP_MIN_BAR_FRAC, save_debug=False):
+def _densest_true_block(values, present):
+    """Return (start, end) of the contiguous run of True `present` entries whose
+    summed `values` is largest. Used to pick the HP bar's rows over other UI."""
+    best_sum, best = -1.0, (0, -1)
+    cur_start, cur_sum = None, 0.0
+    n = len(present)
+    for i in range(n):
+        if present[i]:
+            if cur_start is None:
+                cur_start, cur_sum = i, 0.0
+            cur_sum += values[i]
+            if cur_sum > best_sum:
+                best_sum, best = cur_sum, (cur_start, i)
+        else:
+            cur_start = None
+    return best
+
+
+def detect_hp_bar_fill(hwnd, band_frac, red_min=HP_RED_MIN, dark_max=HP_DARK_MAX,
+                       red_margin=HP_RED_MARGIN, min_bar_frac=HP_MIN_BAR_FRAC,
+                       save_debug=False):
     """Auto-locate the HP bar within a search band and return its fill %.
 
-    The bar is found as the widest contiguous horizontal run of pixels that are
-    either the health fill-color OR the dark empty-track color. HP% is then the
-    fraction of that run that is filled. `band_frac` is (L, T, R, B) as fractions
-    of the window client area, so it is resolution/size independent.
-
-    All color values use PIL's 0-255 HSV scale. If hue_lo > hue_hi the hue range
-    wraps past 255→0 (needed for red bars near hue 0). Returns float 0-100, or
-    None if no bar-like structure is found.
+    Detection is RGB-based, which sidesteps hue-averaging problems and ignores the
+    blue mana bar:
+      * a FILLED pixel has red clearly dominant and bright (RGB, tunable);
+      * the empty part is dark/black.
+    The bar's rows are the densest contiguous block of red-containing rows. Within
+    them, a FILLED column is red for most of the bar's height, whereas a frame line
+    is only 1-2px tall — so a red border no longer reads as 100%. The bar's full
+    width comes from columns that are red (frame/fill) or dark (empty track); HP% =
+    (fill edge - left) / (right - left). `band_frac` is (L,T,R,B) fractions of the
+    window client area, so it is resolution/size independent. Returns 0-100 or None.
     """
     try:
         bbox = _frac_to_bbox(hwnd, band_frac)
         if not bbox:
             return None
-        img = ImageGrab.grab(bbox=bbox, all_screens=True).convert("HSV")
-        arr = np.asarray(img)
-        H, S, V = arr[..., 0], arr[..., 1], arr[..., 2]
+        img = ImageGrab.grab(bbox=bbox, all_screens=True).convert("RGB")
+        arr = np.asarray(img).astype(np.int16)
+        R, G, B = arr[..., 0], arr[..., 1], arr[..., 2]
 
-        if hue_lo <= hue_hi:
-            hue_mask = (H >= hue_lo) & (H <= hue_hi)
-        else:  # wrap-around (e.g. red: 240..255 or 0..12)
-            hue_mask = (H >= hue_lo) | (H <= hue_hi)
-        fill = hue_mask & (S >= fill_sat_min) & (V >= fill_val_min)
-        track = (S <= track_sat_max) & (V <= track_val_max)
-        bar = fill | track
+        red = (R >= red_min) & ((R - G) >= red_margin) & ((R - B) >= red_margin)
+        dark = (R <= dark_max) & (G <= dark_max) & (B <= dark_max)
 
-        h, w = bar.shape
+        h, w = red.shape
         if w == 0 or h == 0:
             return None
 
-        # Vertical: the row with the most fill pixels anchors the bar; expand to
-        # neighbouring rows that still have strong fill coverage.
-        fill_rows = fill.sum(axis=1)
-        if fill_rows.max() < min_bar_frac * w:
-            return None  # no health-colored row → no readable bar
-        cy = int(fill_rows.argmax())
-        thr = 0.4 * fill_rows[cy]
-        y0 = cy
-        while y0 > 0 and fill_rows[y0 - 1] >= thr:
-            y0 -= 1
-        y1 = cy
-        while y1 < h - 1 and fill_rows[y1 + 1] >= thr:
-            y1 += 1
+        # Vertical: pick the densest contiguous block of red-containing rows. This
+        # isolates the HP bar from the (blue) mana bar and separated counters.
+        red_rows = red.sum(axis=1)
+        y0, y1 = _densest_true_block(red_rows, red_rows > 0)
+        if y1 < y0:
+            return None  # no red anywhere → nothing to read
+        bar_h = y1 - y0 + 1
 
-        # Horizontal (fill-anchored, robust to text overlaid on the bar):
-        #   left edge  = leftmost red column (bars fill from the left)
-        #   fill edge  = RIGHTMOST red column — ignores dark HP digits punched into
-        #                the middle of the fill, since red resumes after them
-        #   right end  = extend from the fill edge through the contiguous dark track
-        fill_band = fill[y0:y1 + 1, :]
-        track_band = track[y0:y1 + 1, :]
-        fill_col = fill_band.mean(axis=0) > 0.15   # a column has meaningful red
-        track_col = track_band.mean(axis=0) > 0.5
+        # Per-column red height within the bar rows.
+        col_red = red[y0:y1 + 1, :].sum(axis=0)
+        dark_col = dark[y0:y1 + 1, :].mean(axis=0) > 0.5
 
-        fill_idx = np.flatnonzero(fill_col)
-        if fill_idx.size < min_bar_frac * w:
-            return None  # too little red to be the HP bar
-        bar_left = int(fill_idx[0])
-        fill_right = int(fill_idx[-1])
+        # A SOLID (filled) column is red over most of the bar height; a frame line
+        # is only a couple px tall, so it fails this test.
+        solid = col_red >= max(2, int(0.5 * bar_h))
+        # The bar spans columns that are red (fill or frame) or dark (empty track).
+        member = (col_red >= 1) | dark_col
 
-        x1 = fill_right
-        while x1 + 1 < w and track_col[x1 + 1]:
-            x1 += 1
+        bx0, blen = _widest_true_run(member)
+        if blen < min_bar_frac * w:
+            return None
+        bx1 = bx0 + blen - 1
 
-        total = x1 - bar_left + 1
-        filled = fill_right - bar_left + 1
-        hp = max(0.0, min(100.0, 100.0 * float(filled) / float(total)))
+        # The fill is the contiguous run of solid columns from the left edge. Walk
+        # right tolerating small gaps (HP digits punched into the fill) but stop at
+        # the large empty gap — so an isolated right-side frame edge is not counted.
+        gap_tol = max(3, int(0.04 * blen))
+        fill_right = bx0
+        found_solid = False
+        gap = 0
+        for x in range(bx0, bx1 + 1):
+            if solid[x]:
+                fill_right = x
+                found_solid = True
+                gap = 0
+            else:
+                gap += 1
+                if gap > gap_tol:
+                    break
+        if not found_solid:
+            hp = 0.0
+        else:
+            hp = 100.0 * (fill_right - bx0 + 1) / float(blen)
+        hp = max(0.0, min(100.0, hp))
 
         if save_debug:
             vis = np.zeros((h, w, 3), dtype=np.uint8)
-            vis[track] = (60, 60, 60)
-            vis[fill] = (220, 30, 30)
-            vis[y0:y1 + 1, bar_left] = (0, 255, 0)     # bar left edge
+            vis[dark] = (50, 50, 50)
+            vis[red] = (220, 30, 30)
+            vis[y0:y1 + 1, bx0] = (0, 255, 0)         # bar left edge
             vis[y0:y1 + 1, fill_right] = (255, 255, 0)  # fill edge (HP level)
-            vis[y0:y1 + 1, x1] = (0, 255, 0)            # bar right end
+            vis[y0:y1 + 1, bx1] = (0, 255, 0)         # bar right end
             Image.fromarray(vis, "RGB").save("debug_hp_fill.png")
 
         return hp
     except Exception as e:
         print(f"[HP_READ] Auto-detect failed: {e}")
         return None
+
+
+def diagnose_hp_band(hwnd, band_frac):
+    """Save the raw search-band crop and print a left→right HSV profile, so the
+    fill/empty colors can be tuned against the real UI instead of guessed."""
+    bbox = _frac_to_bbox(hwnd, band_frac)
+    if not bbox:
+        print("[DIAG] Could not resolve window rect.")
+        return
+    img = ImageGrab.grab(bbox=bbox, all_screens=True).convert("RGB")
+    img.save("debug_hp_raw.png")
+    hsv = np.asarray(img.convert("HSV"))
+    H, S, V = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+    h, w = H.shape
+    if h == 0 or w == 0:
+        print("[DIAG] Empty crop.")
+        return
+    # Profile the vertical middle half, where a bottom-anchored bar usually sits.
+    r0, r1 = h // 4, max(h // 4 + 1, 3 * h // 4)
+    buckets = min(20, w)
+    print(f"[DIAG] band {w}x{h}px; profiling rows {r0}-{r1}, left→right (avg H/S/V, 0-255):")
+    for b in range(buckets):
+        c0 = b * w // buckets
+        c1 = max(c0 + 1, (b + 1) * w // buckets)
+        hh = int(H[r0:r1, c0:c1].mean())
+        ss = int(S[r0:r1, c0:c1].mean())
+        vv = int(V[r0:r1, c0:c1].mean())
+        print(f"   {int(100*c0/w):3d}%  H={hh:3d} S={ss:3d} V={vv:3d}")
+    print("[DIAG] Saved raw crop to debug_hp_raw.png")
 
 
 def heal_self(hwnd, heal_vk_param, cast_delay_param):
@@ -465,8 +510,8 @@ def healer_loop(
     buff_interval_param=300,
     reactive_enabled_param=False,
     hp_band_frac_param=None,
-    hp_fill_hue_lo_param=HP_FILL_HUE_LO,
-    hp_fill_hue_hi_param=HP_FILL_HUE_HI,
+    hp_red_min_param=HP_RED_MIN,
+    hp_dark_max_param=HP_DARK_MAX,
     self_heal_threshold_param=SELF_HEAL_THRESHOLD,
     self_panic_threshold_param=SELF_PANIC_THRESHOLD,
 ):
@@ -512,7 +557,7 @@ def healer_loop(
         if reactive_enabled_param and hp_band_frac_param:
             hp = detect_hp_bar_fill(
                 hwnd, hp_band_frac_param,
-                hp_fill_hue_lo_param, hp_fill_hue_hi_param)
+                hp_red_min_param, hp_dark_max_param)
             if hp is not None:
                 now = time.time()
                 below_panic = hp <= self_panic_threshold_param
@@ -615,8 +660,8 @@ class MacroGUI:
         self.hp_band_t_var = tk.StringVar(value=str(HP_SEARCH_BAND_FRAC[1]))
         self.hp_band_r_var = tk.StringVar(value=str(HP_SEARCH_BAND_FRAC[2]))
         self.hp_band_b_var = tk.StringVar(value=str(HP_SEARCH_BAND_FRAC[3]))
-        self.hp_hue_lo_var = tk.StringVar(value=str(HP_FILL_HUE_LO))
-        self.hp_hue_hi_var = tk.StringVar(value=str(HP_FILL_HUE_HI))
+        self.hp_red_min_var = tk.StringVar(value=str(HP_RED_MIN))
+        self.hp_dark_max_var = tk.StringVar(value=str(HP_DARK_MAX))
 
         # Create GUI elements
         self.create_widgets()
@@ -725,11 +770,11 @@ class MacroGUI:
         for var in (self.hp_band_l_var, self.hp_band_t_var, self.hp_band_r_var, self.hp_band_b_var):
             ttk.Entry(region_frame, textvariable=var, width=6).pack(side="left", padx=2)
 
-        ttk.Label(reactive_frame, text="Health hue lo/hi (0-255):").grid(row=3, column=0, sticky="w", padx=5, pady=2)
-        hue_frame = ttk.Frame(reactive_frame)
-        hue_frame.grid(row=3, column=1, columnspan=2, sticky="w", padx=5, pady=2)
-        ttk.Entry(hue_frame, textvariable=self.hp_hue_lo_var, width=6).pack(side="left", padx=2)
-        ttk.Entry(hue_frame, textvariable=self.hp_hue_hi_var, width=6).pack(side="left", padx=2)
+        ttk.Label(reactive_frame, text="Red min / Dark max (0-255):").grid(row=3, column=0, sticky="w", padx=5, pady=2)
+        color_frame = ttk.Frame(reactive_frame)
+        color_frame.grid(row=3, column=1, columnspan=2, sticky="w", padx=5, pady=2)
+        ttk.Entry(color_frame, textvariable=self.hp_red_min_var, width=6).pack(side="left", padx=2)
+        ttk.Entry(color_frame, textvariable=self.hp_dark_max_var, width=6).pack(side="left", padx=2)
         ttk.Button(reactive_frame, text="Test HP Read", command=self.test_hp_read).grid(
             row=3, column=3, sticky="e", padx=5, pady=2)
 
@@ -772,12 +817,16 @@ class MacroGUI:
             return None
         return band
 
-    def _get_hue_range(self):
-        """Parse the hue lo/hi entries into ints, or None."""
+    def _get_color_params(self):
+        """Parse the (red_min, dark_max) entries into ints in 0-255, or None."""
         try:
-            return int(self.hp_hue_lo_var.get()), int(self.hp_hue_hi_var.get())
+            red_min = int(self.hp_red_min_var.get())
+            dark_max = int(self.hp_dark_max_var.get())
         except ValueError:
             return None
+        if not (0 <= red_min <= 255 and 0 <= dark_max <= 255):
+            return None
+        return red_min, dark_max
 
     def test_hp_read(self):
         """Read the HP bar once with the current settings and report the result.
@@ -794,16 +843,18 @@ class MacroGUI:
         if not band:
             messagebox.showerror("Error", "Search band must be four numbers in 0-1 (L<R, T<B).")
             return
-        hue = self._get_hue_range()
-        if not hue:
-            messagebox.showerror("Error", "Health hue lo/hi must be integers (0-255).")
+        color = self._get_color_params()
+        if not color:
+            messagebox.showerror("Error", "Red min / Dark max must be integers (0-255).")
             return
-        hp = detect_hp_bar_fill(hwnd, band, hue[0], hue[1], save_debug=True)
+        hp = detect_hp_bar_fill(hwnd, band, color[0], color[1], save_debug=True)
         legend = "(debug_hp_fill.png: red=fill, grey=track, green=bar ends, yellow=HP level)"
         if hp is None:
             print(f"[TEST] No HP bar found — check band/hue. {legend}")
         else:
             print(f"[TEST] Self HP ~ {hp:.1f}%  {legend}")
+        # Always capture raw pixels + color profile to guide calibration.
+        diagnose_hp_band(hwnd, band)
 
     def poll_log_queue(self):
         """Drain queued console output into the log panel. Runs on the Tk main
@@ -909,15 +960,15 @@ class MacroGUI:
         # Reactive self-heal settings
         reactive_enabled = self.reactive_enabled_var.get()
         hp_band = self._get_search_band()
-        hue_range = self._get_hue_range()
+        color_params = self._get_color_params()
         self_heal_threshold = SELF_HEAL_THRESHOLD
         self_panic_threshold = SELF_PANIC_THRESHOLD
         if reactive_enabled:
             if not hp_band:
                 messagebox.showerror("Input Error", "Search band must be four numbers in 0-1 (L<R, T<B).")
                 return
-            if not hue_range:
-                messagebox.showerror("Input Error", "Health hue lo/hi must be integers (0-255).")
+            if not color_params:
+                messagebox.showerror("Input Error", "Red min / Dark max must be integers (0-255).")
                 return
             try:
                 self_heal_threshold = float(self.self_heal_threshold_var.get())
@@ -954,8 +1005,8 @@ class MacroGUI:
                 buff_interval,
                 reactive_enabled,
                 hp_band if reactive_enabled else None,
-                hue_range[0] if hue_range else HP_FILL_HUE_LO,
-                hue_range[1] if hue_range else HP_FILL_HUE_HI,
+                color_params[0] if color_params else HP_RED_MIN,
+                color_params[1] if color_params else HP_DARK_MAX,
                 self_heal_threshold,
                 self_panic_threshold,
             ),

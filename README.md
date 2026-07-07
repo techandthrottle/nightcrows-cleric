@@ -42,11 +42,24 @@ buffs and anti-AFK — all against a selected game window, with an in-app debug 
 pip install pytesseract pywin32 pillow numpy pynput
 ```
 
-## Running from source
+## Running as administrator (important)
 
-```bash
-python nc_macro_gui.py
-```
+Night Crows usually runs elevated, and Windows blocks input from a non-elevated
+process to an elevated window. So **run the bot elevated too**, or its key presses
+won't reach the game.
+
+- **From source:** open PowerShell **as administrator**, then:
+  ```powershell
+  cd D:\script
+  python nc_macro_gui.py
+  ```
+  If `python` isn't found in the admin context (per-user installs often aren't on
+  the admin PATH), use its full path, e.g.
+  `& "C:\Users\<you>\AppData\Local\Programs\Python\Python313\python.exe" nc_macro_gui.py`.
+- **Built exe:** right-click `dist\Revolt.exe` → **Run as administrator**.
+
+The GUI has no console output — everything goes to the in-app **Debug Log** panel,
+so the launching terminal just idles while the window is open.
 
 ## Building the executable
 
@@ -69,6 +82,21 @@ scale with the window as long as the game HUD scales with it.
    yellow = far). Optionally check specific F-keys to restrict which slots to heal
    (leftmost bar = F1); leave all unchecked to heal everyone.
 4. Adjust until a full bar reads ~100% and the detected boxes sit on the bars.
+
+## Usage
+
+1. Select the game window (**Refresh** if it's not listed).
+2. Set the **Heal Hotbar Key**, **Heal Cooldown**, and **Cast Delay** in General Settings.
+3. **Reactive Self-Heal:** enable it, calibrate the search band + Red values, and set
+   **Self heal below %** and **Self panic below %**.
+4. **Reactive Party Heal:** enable it and set **Party heal below %** / **Party panic
+   below %**. Party size is auto-detected. Optionally tick specific F-keys to limit
+   which slots to heal (leftmost bar = F1); leave all unchecked to heal everyone.
+5. Click **Start Script**; watch the **Debug Log** for `[REACTIVE]` / `[PARTY]` lines.
+
+Thresholds are "heal at/below this percent." A very high heal threshold (e.g. 95%)
+tops members off constantly; ~75–85% heal with ~35–45% panic is a saner starting
+point. Heal priority is: self-panic → party-panic → self-heal → party-heal.
 
 ## Files
 

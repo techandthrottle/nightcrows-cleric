@@ -21,6 +21,9 @@ nc_macro_config.json
 # Calibration screenshots (local reference; geometry is baked into constants)
 party_hp_location/
 
+# Scratch/analysis images
+_*.png
+
 # OS / editor
 Thumbs.db
 .DS_Store

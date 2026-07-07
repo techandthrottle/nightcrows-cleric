@@ -564,7 +564,7 @@ def healer_loop(
 
         # ── Reactive self-heal: highest priority ──────────────────────────────
         # Read our own HP from the bar fill and heal before running the rotation.
-        # Read each near party member's HP once per cycle (dim/far bars → skipped).
+        # Read HP once per cycle: near party members (dim/far bars → skipped) + self.
         party_readings = []  # list of (hp, index, vk)
         if party_reactive_enabled_param and party_member_vks_param:
             n = len(party_member_vks_param)
@@ -572,9 +572,30 @@ def healer_loop(
                 hp = read_party_member_hp(hwnd, i, n, party_red_min_param, party_red_margin_param)
                 if hp is not None:
                     party_readings.append((hp, i, vk))
+        self_hp = None
+        if reactive_enabled_param and hp_band_frac_param:
+            self_hp = detect_hp_bar_fill(hwnd, hp_band_frac_param, hp_red_min_param, hp_red_margin_param)
 
-        # Priority 1 — PARTY PANIC: a critically low member is healed immediately,
-        # ignoring the cooldown and ahead of self-heal and normal party heals.
+        now = time.time()
+
+        def _self_heal(tag):
+            # Ensure the heal lands on self, not a lingering party target.
+            if previous_target_vk is not None and previous_target_vk != VK_SELF_IN_ROTATION:
+                print(f"[REACTIVE] Deselecting party target (VK {previous_target_vk}) before self-heal.")
+                _send_vk(hwnd, previous_target_vk)
+                time.sleep(0.1)
+            print(f"[REACTIVE] {tag}: self HP ~{self_hp:.0f}%. Healing self.")
+            heal_self(hwnd, heal_vk_param, cast_delay_param)
+
+        # Priority 1 — SELF PANIC: keep the healer alive first. Ignores cooldown.
+        if self_hp is not None and self_hp <= self_panic_threshold_param:
+            _self_heal("PANIC")
+            previous_target_vk = None
+            last_self_heal_time = now
+            continue
+
+        # Priority 2 — PARTY PANIC: a critically low member, healed immediately
+        # (ignores cooldown), ahead of normal self and party heals.
         if party_readings:
             critical = [r for r in party_readings if r[0] <= party_panic_threshold_param]
             if critical:
@@ -588,30 +609,15 @@ def healer_loop(
                 cast_heal(hwnd, heal_vk_param, cast_delay_param)
                 continue  # re-check immediately, ignore cooldown
 
-        # Priority 2 — SELF reactive heal (panic ignores cooldown; normal respects it).
-        if reactive_enabled_param and hp_band_frac_param:
-            hp = detect_hp_bar_fill(
-                hwnd, hp_band_frac_param,
-                hp_red_min_param, hp_red_margin_param)
-            if hp is not None:
-                now = time.time()
-                below_panic = hp <= self_panic_threshold_param
-                below_heal = hp <= self_heal_threshold_param
-                if below_panic or (below_heal and now - last_self_heal_time >= heal_cooldown_param):
-                    # Ensure the heal lands on self, not a lingering party target.
-                    if previous_target_vk is not None and previous_target_vk != VK_SELF_IN_ROTATION:
-                        print(f"[REACTIVE] Deselecting party target (VK {previous_target_vk}) before self-heal.")
-                        _send_vk(hwnd, previous_target_vk)
-                        time.sleep(0.1)
-                        previous_target_vk = None
-                    tag = "PANIC" if below_panic else "self-heal"
-                    print(f"[REACTIVE] {tag}: self HP ~{hp:.0f}%. Healing self.")
-                    heal_self(hwnd, heal_vk_param, cast_delay_param)
-                    last_self_heal_time = now
-                    # Re-check immediately; skip the party rotation this tick.
-                    continue
+        # Priority 3 — SELF normal heal (respects cooldown).
+        if (self_hp is not None and self_hp <= self_heal_threshold_param
+                and now - last_self_heal_time >= heal_cooldown_param):
+            _self_heal("self-heal")
+            previous_target_vk = None
+            last_self_heal_time = now
+            continue
 
-        # Priority 3 — normal party heal: lowest member at/below the heal threshold.
+        # Priority 4 — normal party heal: lowest member at/below the heal threshold.
         if party_reactive_enabled_param and party_member_vks_param:
             below = [r for r in party_readings if r[0] <= party_heal_threshold_param]
             if below:

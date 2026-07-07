@@ -18,6 +18,9 @@ game_capture_*.png
 # User settings (per-machine, created at runtime)
 nc_macro_config.json
 
+# Calibration screenshots (local reference; geometry is baked into constants)
+party_hp_location/
+
 # OS / editor
 Thumbs.db
 .DS_Store

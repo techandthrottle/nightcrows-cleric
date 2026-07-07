@@ -9,7 +9,8 @@ import pytesseract
 import win32gui
 import win32con
 import win32api
-from PIL import ImageGrab, ImageOps, ImageStat
+from PIL import ImageGrab, ImageOps, ImageStat, Image
+import numpy as np
 from pynput import keyboard
 from pynput.keyboard import Key
 from pynput.keyboard import Listener as KeyListener
@@ -66,11 +67,26 @@ root_logger.addHandler(console_handler)
 TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 GAME_WINDOW_TITLE = "NIGHT CROWS(2)  "
 
-HP_REGION_RELATIVE = (60, 945, 250, 970) 
+HP_REGION_RELATIVE = (60, 945, 250, 970)
 
-      
-HEAL_COOLDOWN     = 5.0     
-CAST_DELAY        = 0.8     
+# ── Reactive (HP-based) self-healing ──────────────────────────────────────────
+# The player's own HP bar region relative to the window client area:
+# (left, top, right, bottom). Calibrate with the "Test HP Read" button.
+HP_BAR_REGION_RELATIVE = (60, 945, 250, 970)
+# Health-fill color range on PIL's 0-255 HSV Hue scale. Defaults target a red bar.
+# Red sits near hue 0, so if HUE_LO > HUE_HI the range wraps past 255→0.
+HP_FILL_HUE_LO  = 240
+HP_FILL_HUE_HI  = 12
+HP_FILL_SAT_MIN = 80
+HP_FILL_VAL_MIN = 60
+# Heal self when HP drops to/below this percent (respects the heal cooldown).
+SELF_HEAL_THRESHOLD  = 70.0
+# Emergency: heal self immediately, jumping the party rotation, at/below this percent.
+SELF_PANIC_THRESHOLD = 35.0
+
+
+HEAL_COOLDOWN     = 5.0
+CAST_DELAY        = 0.8
 
 HEAL_VK = ord("2")
 
@@ -290,6 +306,45 @@ def read_hp_percent(hwnd, save_debug=False):
     return None
 
 
+def read_hp_percent_by_fill(hwnd, bar_region, hue_lo, hue_hi,
+                            sat_min=HP_FILL_SAT_MIN, val_min=HP_FILL_VAL_MIN,
+                            save_debug=False):
+    """Estimate HP% by measuring how much of the bar is filled with the health
+    color, instead of OCR-ing the HP number. This is far more robust against
+    lighting changes, anti-aliasing, and small pixel drift.
+
+    hue/sat/val are on PIL's 0-255 HSV scale. If hue_lo > hue_hi the hue range
+    is treated as wrapping past 255→0 (needed for red bars near hue 0).
+    Returns a float 0-100, or None on failure.
+    """
+    try:
+        bbox = get_absolute_bbox(hwnd, bar_region)
+        if not bbox:
+            return None
+        img = ImageGrab.grab(bbox=bbox, all_screens=True).convert("HSV")
+        arr = np.asarray(img)
+        h, s, v = arr[..., 0], arr[..., 1], arr[..., 2]
+
+        if hue_lo <= hue_hi:
+            hue_mask = (h >= hue_lo) & (h <= hue_hi)
+        else:  # wrap-around (e.g. red: 240..255 or 0..12)
+            hue_mask = (h >= hue_lo) | (h <= hue_hi)
+        mask = hue_mask & (s >= sat_min) & (v >= val_min)
+
+        # Collapse to columns: a column is "filled" if most of its pixels match.
+        # Bars drain left-to-right, so the filled-column fraction is the HP%.
+        col_filled = mask.mean(axis=0) > 0.5
+        if col_filled.size == 0:
+            return None
+
+        if save_debug:
+            Image.fromarray((mask * 255).astype("uint8")).save("debug_hp_fill.png")
+
+        return 100.0 * float(col_filled.sum()) / float(col_filled.size)
+    except Exception as e:
+        print(f"[HP_READ] Fill read failed: {e}")
+        return None
+
 
 def heal_self(hwnd, heal_vk_param, cast_delay_param):
     print("[HEAL] → SELF (priority)")
@@ -322,10 +377,17 @@ def healer_loop(
     buff_enabled_param=False,
     buff_keys_param=None,
     buff_interval_param=300,
+    reactive_enabled_param=False,
+    hp_bar_region_param=None,
+    hp_fill_hue_lo_param=HP_FILL_HUE_LO,
+    hp_fill_hue_hi_param=HP_FILL_HUE_HI,
+    self_heal_threshold_param=SELF_HEAL_THRESHOLD,
+    self_panic_threshold_param=SELF_PANIC_THRESHOLD,
 ):
     global running, party_index
     previous_target_vk = None
     last_buff_press_time = time.time()
+    last_self_heal_time = 0.0
 
     print(f"DEBUG: Game window title used in healer_loop: '{game_window_title_param}' (Length: {len(game_window_title_param)})")
     hwnd = find_game_window(game_window_title_param)
@@ -337,6 +399,10 @@ def healer_loop(
     print(f"        Party Heals: {'ON' if party_heals_enabled_param else 'OFF'}")
     print(f"        Selected Party VKs: {selected_party_members_vk_param}")
     print(f"        Buffs: {'ON' if buff_enabled_param else 'OFF'}  Keys: {buff_keys_param}  Interval: {buff_interval_param}s")
+    if reactive_enabled_param:
+        print(f"        Reactive Self-Heal: ON  Heal<={self_heal_threshold_param:.0f}%  Panic<={self_panic_threshold_param:.0f}%")
+    else:
+        print("        Reactive Self-Heal: OFF")
     print("        Press F8 to stop.\n")
 
     while not stop_event.is_set():
@@ -355,9 +421,30 @@ def healer_loop(
             print("[HEALER_LOOP] Buff hotbar keys sent.")
             last_buff_press_time = time.time()
 
-        
-
-        
+        # ── Reactive self-heal: highest priority ──────────────────────────────
+        # Read our own HP from the bar fill and heal before running the rotation.
+        if reactive_enabled_param and hp_bar_region_param:
+            hp = read_hp_percent_by_fill(
+                hwnd, hp_bar_region_param,
+                hp_fill_hue_lo_param, hp_fill_hue_hi_param)
+            if hp is not None:
+                now = time.time()
+                below_panic = hp <= self_panic_threshold_param
+                below_heal = hp <= self_heal_threshold_param
+                # Panic ignores the cooldown; normal self-heal respects it.
+                if below_panic or (below_heal and now - last_self_heal_time >= heal_cooldown_param):
+                    # Ensure the heal lands on self, not a lingering party target.
+                    if previous_target_vk is not None and previous_target_vk != VK_SELF_IN_ROTATION:
+                        print(f"[REACTIVE] Deselecting party target (VK {previous_target_vk}) before self-heal.")
+                        _send_vk(hwnd, previous_target_vk)
+                        time.sleep(0.1)
+                        previous_target_vk = None
+                    tag = "PANIC" if below_panic else "self-heal"
+                    print(f"[REACTIVE] {tag}: self HP ~{hp:.0f}%. Healing self.")
+                    heal_self(hwnd, heal_vk_param, cast_delay_param)
+                    last_self_heal_time = now
+                    # Re-check immediately; skip the party rotation this tick.
+                    continue
 
         if party_heals_enabled_param and selected_party_members_vk_param:
             current_target_vk = selected_party_members_vk_param[party_index]
@@ -433,6 +520,17 @@ class MacroGUI:
         self.buff_enabled_var = tk.BooleanVar(value=False)
         self.buff_keys_var = tk.StringVar(value="5 6 7 8")
         self.buff_interval_var = tk.StringVar(value="5")
+
+        # Reactive (HP-based) self-heal settings
+        self.reactive_enabled_var = tk.BooleanVar(value=False)
+        self.self_heal_threshold_var = tk.StringVar(value=str(SELF_HEAL_THRESHOLD))
+        self.self_panic_threshold_var = tk.StringVar(value=str(SELF_PANIC_THRESHOLD))
+        self.hp_bar_left_var = tk.StringVar(value=str(HP_BAR_REGION_RELATIVE[0]))
+        self.hp_bar_top_var = tk.StringVar(value=str(HP_BAR_REGION_RELATIVE[1]))
+        self.hp_bar_right_var = tk.StringVar(value=str(HP_BAR_REGION_RELATIVE[2]))
+        self.hp_bar_bottom_var = tk.StringVar(value=str(HP_BAR_REGION_RELATIVE[3]))
+        self.hp_hue_lo_var = tk.StringVar(value=str(HP_FILL_HUE_LO))
+        self.hp_hue_hi_var = tk.StringVar(value=str(HP_FILL_HUE_HI))
 
         # Create GUI elements
         self.create_widgets()
@@ -522,6 +620,33 @@ class MacroGUI:
         ttk.Radiobutton(afk_frame, text="Disabled", variable=self.anti_afk_mode_var, value="disabled",
                         command=self._on_afk_mode_change).pack(side="left", padx=(8, 0))
 
+        # Frame for Reactive (HP-based) Self-Heal
+        reactive_frame = ttk.LabelFrame(self.master, text="Reactive Self-Heal (reads own HP bar)")
+        reactive_frame.pack(padx=10, pady=5, fill="x")
+
+        ttk.Checkbutton(reactive_frame, text="Enable Reactive Self-Heal",
+                        variable=self.reactive_enabled_var).grid(
+            row=0, column=0, columnspan=4, sticky="w", padx=5, pady=2)
+
+        ttk.Label(reactive_frame, text="Heal below (%):").grid(row=1, column=0, sticky="w", padx=5, pady=2)
+        ttk.Entry(reactive_frame, textvariable=self.self_heal_threshold_var, width=6).grid(row=1, column=1, sticky="w", padx=5, pady=2)
+        ttk.Label(reactive_frame, text="Panic below (%):").grid(row=1, column=2, sticky="w", padx=5, pady=2)
+        ttk.Entry(reactive_frame, textvariable=self.self_panic_threshold_var, width=6).grid(row=1, column=3, sticky="w", padx=5, pady=2)
+
+        ttk.Label(reactive_frame, text="HP bar region (L T R B):").grid(row=2, column=0, sticky="w", padx=5, pady=2)
+        region_frame = ttk.Frame(reactive_frame)
+        region_frame.grid(row=2, column=1, columnspan=3, sticky="w", padx=5, pady=2)
+        for var in (self.hp_bar_left_var, self.hp_bar_top_var, self.hp_bar_right_var, self.hp_bar_bottom_var):
+            ttk.Entry(region_frame, textvariable=var, width=6).pack(side="left", padx=2)
+
+        ttk.Label(reactive_frame, text="Health hue lo/hi (0-255):").grid(row=3, column=0, sticky="w", padx=5, pady=2)
+        hue_frame = ttk.Frame(reactive_frame)
+        hue_frame.grid(row=3, column=1, columnspan=2, sticky="w", padx=5, pady=2)
+        ttk.Entry(hue_frame, textvariable=self.hp_hue_lo_var, width=6).pack(side="left", padx=2)
+        ttk.Entry(hue_frame, textvariable=self.hp_hue_hi_var, width=6).pack(side="left", padx=2)
+        ttk.Button(reactive_frame, text="Test HP Read", command=self.test_hp_read).grid(
+            row=3, column=3, sticky="e", padx=5, pady=2)
+
         # Frame for the in-app debug log (replaces the separate terminal window)
         log_frame = ttk.LabelFrame(self.master, text="Debug Log")
         log_frame.pack(padx=10, pady=5, fill="both", expand=True)
@@ -542,6 +667,50 @@ class MacroGUI:
         self.log_text.config(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.config(state="disabled")
+
+    def _get_hp_bar_region(self):
+        """Parse the four HP-bar-region entries into an (L, T, R, B) tuple, or None."""
+        try:
+            return (
+                int(self.hp_bar_left_var.get()),
+                int(self.hp_bar_top_var.get()),
+                int(self.hp_bar_right_var.get()),
+                int(self.hp_bar_bottom_var.get()),
+            )
+        except ValueError:
+            return None
+
+    def _get_hue_range(self):
+        """Parse the hue lo/hi entries into ints, or None."""
+        try:
+            return int(self.hp_hue_lo_var.get()), int(self.hp_hue_hi_var.get())
+        except ValueError:
+            return None
+
+    def test_hp_read(self):
+        """Read the HP bar once with the current settings and report the result.
+        Saves debug_hp_fill.png so the region/color can be calibrated."""
+        title = self.game_window_title_var.get()
+        if not title:
+            messagebox.showerror("Error", "Please select a game window first.")
+            return
+        hwnd = find_game_window(title)
+        if not hwnd:
+            messagebox.showerror("Error", "Game window not found.")
+            return
+        region = self._get_hp_bar_region()
+        if not region:
+            messagebox.showerror("Error", "HP bar region must be four integers.")
+            return
+        hue = self._get_hue_range()
+        if not hue:
+            messagebox.showerror("Error", "Health hue lo/hi must be integers (0-255).")
+            return
+        hp = read_hp_percent_by_fill(hwnd, region, hue[0], hue[1], save_debug=True)
+        if hp is None:
+            print("[TEST] HP read returned None — check region/hue. Saved debug_hp_fill.png.")
+        else:
+            print(f"[TEST] Self HP ~ {hp:.1f}%  (mask saved to debug_hp_fill.png)")
 
     def poll_log_queue(self):
         """Drain queued console output into the log panel. Runs on the Tk main
@@ -644,6 +813,30 @@ class MacroGUI:
             messagebox.showwarning("Warning", "Buffs enabled but no valid buff keys entered.")
             return
 
+        # Reactive self-heal settings
+        reactive_enabled = self.reactive_enabled_var.get()
+        hp_bar_region = self._get_hp_bar_region()
+        hue_range = self._get_hue_range()
+        self_heal_threshold = SELF_HEAL_THRESHOLD
+        self_panic_threshold = SELF_PANIC_THRESHOLD
+        if reactive_enabled:
+            if not hp_bar_region:
+                messagebox.showerror("Input Error", "HP bar region must be four integers.")
+                return
+            if not hue_range:
+                messagebox.showerror("Input Error", "Health hue lo/hi must be integers (0-255).")
+                return
+            try:
+                self_heal_threshold = float(self.self_heal_threshold_var.get())
+                self_panic_threshold = float(self.self_panic_threshold_var.get())
+                if not (0 < self_panic_threshold <= self_heal_threshold <= 100):
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror(
+                    "Input Error",
+                    "Thresholds must satisfy 0 < panic <= heal <= 100.")
+                return
+
         stop_event.clear()
         running = True
         party_index = 0 # Reset party index on start
@@ -666,6 +859,12 @@ class MacroGUI:
                 buff_enabled,
                 buff_keys,
                 buff_interval,
+                reactive_enabled,
+                hp_bar_region if reactive_enabled else None,
+                hue_range[0] if hue_range else HP_FILL_HUE_LO,
+                hue_range[1] if hue_range else HP_FILL_HUE_HI,
+                self_heal_threshold,
+                self_panic_threshold,
             ),
             daemon=True
         )

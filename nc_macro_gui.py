@@ -104,6 +104,11 @@ PARTY_DIM_MARGIN     = 50
 PARTY_RED_MIN        = 160
 PARTY_RED_MARGIN     = 70
 PARTY_BAR_MIN_RED_PX = 3       # fewer bright-red px than this => far => skip healing
+# Each real party member also has a teal MP bar just below the red HP bar. Requiring
+# it rejects stray game-world red (damage numbers, effects) that would otherwise be
+# mistaken for a bar. Teal = blue-dominant.
+PARTY_TEAL_B_MIN     = 100
+PARTY_TEAL_MARGIN    = 40      # blue AND green must exceed red by at least this much
 PARTY_HEAL_THRESHOLD  = 70.0   # heal a member at/below this percent
 PARTY_PANIC_THRESHOLD = 35.0   # emergency: heal a member at/below this immediately,
                                # ignoring cooldown, above self and normal party heals
@@ -452,10 +457,15 @@ def detect_party_members(hwnd):
         R, G, B = arr[..., 0], arr[..., 1], arr[..., 2]
         dim = (R >= PARTY_DIM_RED_MIN) & ((R - G) >= PARTY_DIM_MARGIN) & ((R - B) >= PARTY_DIM_MARGIN)
         bright = (R >= PARTY_RED_MIN) & ((R - G) >= PARTY_RED_MARGIN) & ((R - B) >= PARTY_RED_MARGIN)
+        teal = (B >= PARTY_TEAL_B_MIN) & ((B - R) >= PARTY_TEAL_MARGIN) & ((G - R) >= PARTY_TEAL_MARGIN)
+        teal_col = teal.any(axis=0)
 
         barw_px = max(1, int(PARTY_BAR_WIDTH_FRAC * W))
         runs = _column_runs(dim.any(axis=0), gap=max(6, int(0.013 * W)),
                              min_w=max(3, int(0.004 * W)))
+        # Keep only runs that have a teal MP bar under them — a real party member is
+        # red HP over teal MP; stray game-world red has no teal and is discarded.
+        runs = [(a, b) for a, b in runs if teal_col[a:a + barw_px].any()]
         if not runs:
             return []
 

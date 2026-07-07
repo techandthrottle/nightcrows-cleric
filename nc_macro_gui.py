@@ -70,17 +70,16 @@ GAME_WINDOW_TITLE = "NIGHT CROWS(2)  "
 HP_REGION_RELATIVE = (60, 945, 250, 970)
 
 # ── Reactive (HP-based) self-healing ──────────────────────────────────────────
-# Search band to look for the HP bar in, as fractions (0-1) of the window client
-# area: (left, top, right, bottom). Because it is relative, calibration survives
-# window resizing. It only needs to loosely contain the HP bar.
-HP_SEARCH_BAND_FRAC = (0.03, 0.90, 0.30, 0.99)
-# HP fill is bright RED (red channel clearly dominant); the empty part is dark/black.
-# Detected by RGB (not hue) so it also ignores the blue mana bar. Values are 0-255.
-HP_RED_MIN    = 80    # a "filled" pixel needs at least this much red
-HP_RED_MARGIN = 30    # ...and red must exceed green AND blue by at least this much
-HP_DARK_MAX   = 70    # a pixel is "empty/track" if R, G and B are all <= this
-# The detected bar must span at least this fraction of the search-band width.
-HP_MIN_BAR_FRAC = 0.15
+# Band framing the HP bar, as fractions (0-1) of the window client area:
+# (left, top, right, bottom). Left edge ≈ bar start, right edge ≈ bar end. Because
+# it is relative, calibration survives window resizing (the HUD scales with it).
+# Calibrate with the "Test HP Read" button + debug_hp_fill.png.
+HP_SEARCH_BAND_FRAC = (0.045, 0.950, 0.130, 0.963)
+# HP fill is vivid RED: red channel bright and clearly dominant over green/blue.
+# Detected by RGB (not hue). White digits (R≈G≈B), the brown background/dark track
+# (low red), and the blue mana bar all fail this, so only the fill matches. 0-255.
+HP_RED_MIN    = 120   # a "filled" pixel needs at least this much red
+HP_RED_MARGIN = 70    # ...and red must exceed green AND blue by at least this much
 # Heal self when HP drops to/below this percent (respects the heal cooldown).
 SELF_HEAL_THRESHOLD  = 70.0
 # Emergency: heal self immediately, jumping the party rotation, at/below this percent.
@@ -324,54 +323,23 @@ def _frac_to_bbox(hwnd, band_frac):
     )
 
 
-def _widest_true_run(flags):
-    """Return (start, length) of the widest contiguous True run in a 1-D array."""
-    best_start = best_len = cur_start = cur_len = 0
-    for i, on in enumerate(flags):
-        if on:
-            if cur_len == 0:
-                cur_start = i
-            cur_len += 1
-            if cur_len > best_len:
-                best_len, best_start = cur_len, cur_start
-        else:
-            cur_len = 0
-    return best_start, best_len
-
-
-def _densest_true_block(values, present):
-    """Return (start, end) of the contiguous run of True `present` entries whose
-    summed `values` is largest. Used to pick the HP bar's rows over other UI."""
-    best_sum, best = -1.0, (0, -1)
-    cur_start, cur_sum = None, 0.0
-    n = len(present)
-    for i in range(n):
-        if present[i]:
-            if cur_start is None:
-                cur_start, cur_sum = i, 0.0
-            cur_sum += values[i]
-            if cur_sum > best_sum:
-                best_sum, best = cur_sum, (cur_start, i)
-        else:
-            cur_start = None
-    return best
-
-
-def detect_hp_bar_fill(hwnd, band_frac, red_min=HP_RED_MIN, dark_max=HP_DARK_MAX,
-                       red_margin=HP_RED_MARGIN, min_bar_frac=HP_MIN_BAR_FRAC,
+def detect_hp_bar_fill(hwnd, band_frac, red_min=HP_RED_MIN, red_margin=HP_RED_MARGIN,
                        save_debug=False):
-    """Auto-locate the HP bar within a search band and return its fill %.
+    """Return the HP bar's fill % by measuring the vivid-red fill within a band
+    that frames the bar.
 
-    Detection is RGB-based, which sidesteps hue-averaging problems and ignores the
-    blue mana bar:
-      * a FILLED pixel has red clearly dominant and bright (RGB, tunable);
-      * the empty part is dark/black.
-    The bar's rows are the densest contiguous block of red-containing rows. Within
-    them, a FILLED column is red for most of the bar's height, whereas a frame line
-    is only 1-2px tall — so a red border no longer reads as 100%. The bar's full
-    width comes from columns that are red (frame/fill) or dark (empty track); HP% =
-    (fill edge - left) / (right - left). `band_frac` is (L,T,R,B) fractions of the
-    window client area, so it is resolution/size independent. Returns 0-100 or None.
+    The band (L,T,R,B, fractions of the window client area) must frame the HP bar:
+    left edge ≈ bar start, right edge ≈ bar end. Because it is fractional it scales
+    with the window. The empty/drained part of this game's bar is visually identical
+    to the brown background, so it is NOT auto-detected; instead the bar's full
+    width is taken from the band width, and only the bright-red fill is measured:
+
+        HP% = (rightmost red column - leftmost red column) / (band width - leftmost)
+
+    A FILLED pixel has the red channel bright (>= red_min) and clearly dominant over
+    green and blue (>= red_margin). Nothing else in the UI matches: white digits have
+    R≈G≈B, the brown background and dark track have low red, the mana bar is blue.
+    Returns 0-100, or None on failure.
     """
     try:
         bbox = _frac_to_bbox(hwnd, band_frac)
@@ -382,69 +350,36 @@ def detect_hp_bar_fill(hwnd, band_frac, red_min=HP_RED_MIN, dark_max=HP_DARK_MAX
         R, G, B = arr[..., 0], arr[..., 1], arr[..., 2]
 
         red = (R >= red_min) & ((R - G) >= red_margin) & ((R - B) >= red_margin)
-        dark = (R <= dark_max) & (G <= dark_max) & (B <= dark_max)
-
         h, w = red.shape
         if w == 0 or h == 0:
             return None
 
-        # Vertical: pick the densest contiguous block of red-containing rows. This
-        # isolates the HP bar from the (blue) mana bar and separated counters.
-        red_rows = red.sum(axis=1)
-        y0, y1 = _densest_true_block(red_rows, red_rows > 0)
-        if y1 < y0:
-            return None  # no red anywhere → nothing to read
-        bar_h = y1 - y0 + 1
-
-        # Per-column red height within the bar rows.
-        col_red = red[y0:y1 + 1, :].sum(axis=0)
-        dark_col = dark[y0:y1 + 1, :].mean(axis=0) > 0.5
-
-        # A SOLID (filled) column is red over most of the bar height; a frame line
-        # is only a couple px tall, so it fails this test.
-        solid = col_red >= max(2, int(0.5 * bar_h))
-        # The bar spans columns that are red (fill or frame) or dark (empty track).
-        member = (col_red >= 1) | dark_col
-
-        bx0, blen = _widest_true_run(member)
-        if blen < min_bar_frac * w:
-            return None
-        bx1 = bx0 + blen - 1
-
-        # The fill is the contiguous run of solid columns from the left edge. Walk
-        # right tolerating small gaps (HP digits punched into the fill) but stop at
-        # the large empty gap — so an isolated right-side frame edge is not counted.
-        gap_tol = max(3, int(0.04 * blen))
-        fill_right = bx0
-        found_solid = False
-        gap = 0
-        for x in range(bx0, bx1 + 1):
-            if solid[x]:
-                fill_right = x
-                found_solid = True
-                gap = 0
-            else:
-                gap += 1
-                if gap > gap_tol:
-                    break
-        if not found_solid:
+        # Columns containing any vivid red. The fill is contiguous from the bar's
+        # left; to its right there is no red (empty is dark, digits are white), so
+        # the rightmost red column is the fill edge even with digits over the fill.
+        col_has_red = red.any(axis=0)
+        idx = np.flatnonzero(col_has_red)
+        if idx.size == 0:
             hp = 0.0
+            bar_left = fill_right = 0
         else:
-            hp = 100.0 * (fill_right - bx0 + 1) / float(blen)
+            bar_left = int(idx[0])
+            fill_right = int(idx[-1])
+            denom = w - bar_left
+            hp = 100.0 * (fill_right - bar_left + 1) / float(denom) if denom > 0 else 0.0
         hp = max(0.0, min(100.0, hp))
 
         if save_debug:
             vis = np.zeros((h, w, 3), dtype=np.uint8)
-            vis[dark] = (50, 50, 50)
             vis[red] = (220, 30, 30)
-            vis[y0:y1 + 1, bx0] = (0, 255, 0)         # bar left edge
-            vis[y0:y1 + 1, fill_right] = (255, 255, 0)  # fill edge (HP level)
-            vis[y0:y1 + 1, bx1] = (0, 255, 0)         # bar right end
+            vis[:, bar_left] = (0, 255, 0)      # bar left edge (band left ≈ this)
+            vis[:, fill_right] = (255, 255, 0)  # fill edge (current HP level)
+            vis[:, w - 1] = (0, 255, 0)         # band right edge (≈ bar end)
             Image.fromarray(vis, "RGB").save("debug_hp_fill.png")
 
         return hp
     except Exception as e:
-        print(f"[HP_READ] Auto-detect failed: {e}")
+        print(f"[HP_READ] Detection failed: {e}")
         return None
 
 
@@ -511,7 +446,7 @@ def healer_loop(
     reactive_enabled_param=False,
     hp_band_frac_param=None,
     hp_red_min_param=HP_RED_MIN,
-    hp_dark_max_param=HP_DARK_MAX,
+    hp_red_margin_param=HP_RED_MARGIN,
     self_heal_threshold_param=SELF_HEAL_THRESHOLD,
     self_panic_threshold_param=SELF_PANIC_THRESHOLD,
 ):
@@ -557,7 +492,7 @@ def healer_loop(
         if reactive_enabled_param and hp_band_frac_param:
             hp = detect_hp_bar_fill(
                 hwnd, hp_band_frac_param,
-                hp_red_min_param, hp_dark_max_param)
+                hp_red_min_param, hp_red_margin_param)
             if hp is not None:
                 now = time.time()
                 below_panic = hp <= self_panic_threshold_param
@@ -661,7 +596,7 @@ class MacroGUI:
         self.hp_band_r_var = tk.StringVar(value=str(HP_SEARCH_BAND_FRAC[2]))
         self.hp_band_b_var = tk.StringVar(value=str(HP_SEARCH_BAND_FRAC[3]))
         self.hp_red_min_var = tk.StringVar(value=str(HP_RED_MIN))
-        self.hp_dark_max_var = tk.StringVar(value=str(HP_DARK_MAX))
+        self.hp_red_margin_var = tk.StringVar(value=str(HP_RED_MARGIN))
 
         # Create GUI elements
         self.create_widgets()
@@ -770,11 +705,11 @@ class MacroGUI:
         for var in (self.hp_band_l_var, self.hp_band_t_var, self.hp_band_r_var, self.hp_band_b_var):
             ttk.Entry(region_frame, textvariable=var, width=6).pack(side="left", padx=2)
 
-        ttk.Label(reactive_frame, text="Red min / Dark max (0-255):").grid(row=3, column=0, sticky="w", padx=5, pady=2)
+        ttk.Label(reactive_frame, text="Red min / Red margin (0-255):").grid(row=3, column=0, sticky="w", padx=5, pady=2)
         color_frame = ttk.Frame(reactive_frame)
         color_frame.grid(row=3, column=1, columnspan=2, sticky="w", padx=5, pady=2)
         ttk.Entry(color_frame, textvariable=self.hp_red_min_var, width=6).pack(side="left", padx=2)
-        ttk.Entry(color_frame, textvariable=self.hp_dark_max_var, width=6).pack(side="left", padx=2)
+        ttk.Entry(color_frame, textvariable=self.hp_red_margin_var, width=6).pack(side="left", padx=2)
         ttk.Button(reactive_frame, text="Test HP Read", command=self.test_hp_read).grid(
             row=3, column=3, sticky="e", padx=5, pady=2)
 
@@ -818,15 +753,15 @@ class MacroGUI:
         return band
 
     def _get_color_params(self):
-        """Parse the (red_min, dark_max) entries into ints in 0-255, or None."""
+        """Parse the (red_min, red_margin) entries into ints in 0-255, or None."""
         try:
             red_min = int(self.hp_red_min_var.get())
-            dark_max = int(self.hp_dark_max_var.get())
+            red_margin = int(self.hp_red_margin_var.get())
         except ValueError:
             return None
-        if not (0 <= red_min <= 255 and 0 <= dark_max <= 255):
+        if not (0 <= red_min <= 255 and 0 <= red_margin <= 255):
             return None
-        return red_min, dark_max
+        return red_min, red_margin
 
     def test_hp_read(self):
         """Read the HP bar once with the current settings and report the result.
@@ -848,7 +783,7 @@ class MacroGUI:
             messagebox.showerror("Error", "Red min / Dark max must be integers (0-255).")
             return
         hp = detect_hp_bar_fill(hwnd, band, color[0], color[1], save_debug=True)
-        legend = "(debug_hp_fill.png: red=fill, grey=track, green=bar ends, yellow=HP level)"
+        legend = "(debug_hp_fill.png: red=detected fill, green=band ends, yellow=HP level)"
         if hp is None:
             print(f"[TEST] No HP bar found — check band/hue. {legend}")
         else:
@@ -1006,7 +941,7 @@ class MacroGUI:
                 reactive_enabled,
                 hp_band if reactive_enabled else None,
                 color_params[0] if color_params else HP_RED_MIN,
-                color_params[1] if color_params else HP_DARK_MAX,
+                color_params[1] if color_params else HP_RED_MARGIN,
                 self_heal_threshold,
                 self_panic_threshold,
             ),

@@ -1,8 +1,8 @@
 # Night Crows Cleric — Auto Healer
 
-A Tkinter-based helper for the Cleric (support) playstyle in Night Crows Global. It
-automates a healer rotation, timed buffs, and anti-AFK activity against a selected
-game window, with an in-app debug log panel.
+A Tkinter-based helper for the Cleric (support) playstyle in Night Crows Global.
+It reads HP bars off the screen and reactively heals you and your party, plus timed
+buffs and anti-AFK — all against a selected game window, with an in-app debug log.
 
 > **Note:** This is personal-use tooling. Automating input may conflict with the
 > game's Terms of Service — use at your own risk.
@@ -10,11 +10,24 @@ game window, with an in-app debug log panel.
 ## Features
 
 - **Game window selection** — auto-detects `NIGHT CROWS` windows and lets you pick one.
-- **Rotational healing** — cycles heals across selected party members (F1–F4) and
-  optionally self, on a configurable cooldown.
+- **Reactive self-healing** — reads your own HP bar and heals when it drops below a
+  threshold, with a separate **panic** threshold that ignores the cooldown.
+- **Reactive party healing** — reads each party member's HP bar (bottom-center row)
+  and heals the lowest member below the threshold, with its own **panic** threshold.
+  Far/out-of-range members (dimmed bars) are skipped automatically.
+- **HP detection by color-fill** — instead of fragile OCR, HP is measured from the
+  vivid-red fill of the bar within a resolution-independent (fractional) band, so
+  calibration survives window resizing.
+- **Heal priority** — self-panic → party-panic → self-heal → party-heal → rotation.
+- **Rotational healing** (legacy) — cycles heals across F1–F4 and optionally self on
+  a fixed cooldown; used as a fallback when reactive party healing is off.
 - **Timed buffs** — presses configured hotbar keys on an interval.
 - **Anti-AFK** — random WASD movement, safe-key presses, or disabled.
 - **Power-saver detection** — wakes a dimmed game window before casting.
+- **Calibration tools** — `Capture` (save a window screenshot), `Test HP Read` and
+  `Test Party Read` (report readings + save annotated overlay images).
+- **Settings persistence** — all options are saved to `nc_macro_config.json` and
+  restored on the next launch.
 - **In-app debug log** — all output is shown inside the GUI (no separate terminal).
 
 ## Requirements
@@ -22,11 +35,11 @@ game window, with an in-app debug log panel.
 - Windows
 - Python 3.11+
 - [Tesseract-OCR](https://github.com/tesseract-ocr/tesseract) installed at
-  `C:\Program Files\Tesseract-OCR\tesseract.exe` (path configurable in the script)
-- Python packages: `pytesseract`, `pywin32`, `pillow`, `pynput`
+  `C:\Program Files\Tesseract-OCR\tesseract.exe` (only used by the legacy OCR helpers)
+- Python packages: `pytesseract`, `pywin32`, `pillow`, `numpy`, `pynput`
 
 ```bash
-pip install pytesseract pywin32 pillow pynput
+pip install pytesseract pywin32 pillow numpy pynput
 ```
 
 ## Running from source
@@ -43,6 +56,19 @@ pyinstaller nc_macro_gui.spec
 
 The built app is written to `dist\nc_macro_gui.exe` (windowed — no console).
 
+## Calibrating HP detection
+
+Detection is tuned to a captured window; because the bands are fractional they
+scale with the window as long as the game HUD scales with it.
+
+1. Select your game window and click **Capture** to save a screenshot (for reference).
+2. **Self:** set the search band and Red min/margin, then click **Test HP Read** —
+   `debug_hp_fill.png` shows the detected fill vs the band edges.
+3. **Party:** set **Party size (bars shown)** = party members excluding yourself, check
+   which F-keys to heal (leftmost bar = F1, next = F2, …), then click
+   **Test Party Read** — `debug_party.png` overlays each band on the bars.
+4. Adjust until a full bar reads ~100% and the bands sit on the bars.
+
 ## Files
 
 | File | Purpose |
@@ -50,6 +76,9 @@ The built app is written to `dist\nc_macro_gui.exe` (windowed — no console).
 | `nc_macro_gui.py` | Main GUI application |
 | `nc_macro.py` | Original CLI macro (pre-GUI) |
 | `nc_macro_gui.spec` | PyInstaller build spec |
-| `calibrate_hp.py`, `find_hp_region.py`, `diagnose_hp.py` | OCR calibration / diagnostic helpers |
+| `calibrate_hp.py`, `find_hp_region.py`, `diagnose_hp.py` | Legacy OCR calibration / diagnostic helpers |
 | `find_windows.py` | Lists visible window titles |
-| `read_hp_memory.py` | Experimental memory-read prototype |
+| `read_hp_memory.py` | Experimental memory-read prototype (unused) |
+
+Runtime-generated files (git-ignored): `nc_macro_config.json` (settings),
+`debug_*.png` (calibration images), `game_capture_*.png` (captures).

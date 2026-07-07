@@ -88,9 +88,9 @@ HP_RED_MARGIN = 70    # ...and red must exceed green AND blue by at least this m
 # the hotbar. Geometry as fractions of the window client area (calibrated from
 # 1131x594 captures; scales with the window). Bar i center (0-based, left→right,
 # N members) = CENTER_X + (i - (N-1)/2) * SPACING.
-PARTY_BAR_CENTER_X_FRAC = 0.5013   # horizontal center of the whole row
-PARTY_BAR_SPACING_FRAC  = 0.0928   # center-to-center spacing between members
-PARTY_BAR_WIDTH_FRAC    = 0.0637   # width of one member's bar
+PARTY_BAR_CENTER_X_FRAC = 0.5075   # horizontal center of the whole row (x~574 @1131)
+PARTY_BAR_SPACING_FRAC  = 0.0964   # center-to-center spacing between members (~109px)
+PARTY_BAR_WIDTH_FRAC    = 0.0619   # width of one member's bar (~70px)
 PARTY_BAR_Y_FRAC        = 0.8838   # vertical center of the bars
 PARTY_BAR_HALFH_FRAC    = 0.0090   # half-height of the sampling band
 # Party bars dim when the member is far (out of heal range): near bars are bright

@@ -17,6 +17,8 @@ from pynput.keyboard import Listener as KeyListener
 import logging
 import sys
 import queue
+import os
+import json
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  Console output → in-app log panel
@@ -100,8 +102,16 @@ PARTY_NAMES_DEFAULT = ["F1", "F2", "F3", "F4"]
 
 BUFF_HOTBAR_KEYS = [ord('5'), ord('6'), ord('7'), ord('8')]
 
-POWER_SAVER_BRIGHTNESS_THRESHOLD = 30   
+POWER_SAVER_BRIGHTNESS_THRESHOLD = 30
 POWER_SAVER_SAMPLE_REGION = (400, 300, 900, 500)
+
+# Settings are persisted next to the executable (frozen) or this script (source),
+# so a calibrated setup survives restarts.
+if getattr(sys, "frozen", False):
+    _CONFIG_DIR = os.path.dirname(sys.executable)
+else:
+    _CONFIG_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(_CONFIG_DIR, "nc_macro_config.json")
 
 def find_crow_windows():
     results = []
@@ -600,8 +610,12 @@ class MacroGUI:
 
         # Create GUI elements
         self.create_widgets()
+        self.load_config()  # Restore saved settings before populating the dropdown
+        self._on_afk_mode_change()  # Sync widget enable-state to loaded settings
         self.populate_game_windows() # Populate dropdown on startup
         self.poll_log_queue() # Start draining console output into the log panel
+        # Persist settings automatically when the window is closed.
+        master.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def create_widgets(self):
         # Frame for Script Control
@@ -613,6 +627,9 @@ class MacroGUI:
 
         self.stop_button = ttk.Button(script_frame, text="Stop Script", command=self.stop_script, state="disabled")
         self.stop_button.pack(side="left", padx=5, pady=5)
+
+        ttk.Button(script_frame, text="Save Settings", command=self.save_config).pack(
+            side="right", padx=5, pady=5)
 
         # Frame for Game Window Selection
         game_window_frame = ttk.LabelFrame(self.master, text="Game Window Selection")
@@ -807,6 +824,87 @@ class MacroGUI:
             self.safe_keys_entry.config(state="normal")
         else:
             self.safe_keys_entry.config(state="disabled")
+
+    def _gather_settings(self):
+        """Collect all GUI settings into a plain dict for JSON persistence."""
+        return {
+            "game_window_title": self.game_window_title_var.get(),
+            "party_heals_enabled": self.party_heals_enabled_var.get(),
+            "f_keys": {k: v.get() for k, v in self.f_keys_vars.items()},
+            "self_heal_in_rotation": self.self_heal_in_rotation_var.get(),
+            "cast_delay": self.cast_delay_var.get(),
+            "heal_key": self.heal_key_var.get(),
+            "heal_cooldown": self.heal_cooldown_var.get(),
+            "anti_afk_mode": self.anti_afk_mode_var.get(),
+            "safe_afk_keys": self.safe_afk_keys_var.get(),
+            "buff_enabled": self.buff_enabled_var.get(),
+            "buff_keys": self.buff_keys_var.get(),
+            "buff_interval": self.buff_interval_var.get(),
+            "reactive_enabled": self.reactive_enabled_var.get(),
+            "self_heal_threshold": self.self_heal_threshold_var.get(),
+            "self_panic_threshold": self.self_panic_threshold_var.get(),
+            "hp_band": [self.hp_band_l_var.get(), self.hp_band_t_var.get(),
+                        self.hp_band_r_var.get(), self.hp_band_b_var.get()],
+            "hp_red_min": self.hp_red_min_var.get(),
+            "hp_red_margin": self.hp_red_margin_var.get(),
+        }
+
+    def _apply_settings(self, d):
+        """Apply a settings dict (from JSON) to the GUI variables, tolerating
+        missing/extra keys so old config files keep working."""
+        def setvar(var, key):
+            if key in d and d[key] is not None:
+                var.set(d[key])
+        setvar(self.game_window_title_var, "game_window_title")
+        setvar(self.party_heals_enabled_var, "party_heals_enabled")
+        for k, v in (d.get("f_keys") or {}).items():
+            if k in self.f_keys_vars:
+                self.f_keys_vars[k].set(v)
+        setvar(self.self_heal_in_rotation_var, "self_heal_in_rotation")
+        setvar(self.cast_delay_var, "cast_delay")
+        setvar(self.heal_key_var, "heal_key")
+        setvar(self.heal_cooldown_var, "heal_cooldown")
+        setvar(self.anti_afk_mode_var, "anti_afk_mode")
+        setvar(self.safe_afk_keys_var, "safe_afk_keys")
+        setvar(self.buff_enabled_var, "buff_enabled")
+        setvar(self.buff_keys_var, "buff_keys")
+        setvar(self.buff_interval_var, "buff_interval")
+        setvar(self.reactive_enabled_var, "reactive_enabled")
+        setvar(self.self_heal_threshold_var, "self_heal_threshold")
+        setvar(self.self_panic_threshold_var, "self_panic_threshold")
+        band = d.get("hp_band")
+        if isinstance(band, list) and len(band) == 4:
+            self.hp_band_l_var.set(band[0])
+            self.hp_band_t_var.set(band[1])
+            self.hp_band_r_var.set(band[2])
+            self.hp_band_b_var.set(band[3])
+        setvar(self.hp_red_min_var, "hp_red_min")
+        setvar(self.hp_red_margin_var, "hp_red_margin")
+
+    def save_config(self, silent=False):
+        try:
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(self._gather_settings(), f, indent=2)
+            if not silent:
+                print(f"[CONFIG] Saved to {CONFIG_PATH}")
+        except Exception as e:
+            print(f"[CONFIG] Save failed: {e}")
+
+    def load_config(self):
+        if not os.path.exists(CONFIG_PATH):
+            return
+        try:
+            with open(CONFIG_PATH, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            print(f"[CONFIG] Load failed: {e}")
+            return
+        self._apply_settings(data)
+        print(f"[CONFIG] Loaded settings from {CONFIG_PATH}")
+
+    def on_close(self):
+        self.save_config(silent=True)
+        self.master.destroy()
 
     def populate_game_windows(self):
         windows = find_crow_windows()

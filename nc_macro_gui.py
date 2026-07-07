@@ -97,8 +97,10 @@ PARTY_BAR_HALFH_FRAC    = 0.0090   # half-height of the sampling band
 # red (R~200+), far bars are dim (R~125). A higher red-min than self filters far.
 PARTY_RED_MIN        = 160
 PARTY_RED_MARGIN     = 70
-PARTY_BAR_MIN_RED_PX = 3     # fewer vivid-red px than this => far/absent => skip
-PARTY_HEAL_THRESHOLD = 70.0  # heal a member at/below this percent
+PARTY_BAR_MIN_RED_PX = 3       # fewer vivid-red px than this => far/absent => skip
+PARTY_HEAL_THRESHOLD  = 70.0   # heal a member at/below this percent
+PARTY_PANIC_THRESHOLD = 35.0   # emergency: heal a member at/below this immediately,
+                               # ignoring cooldown, above self and normal party heals
 # Heal self when HP drops to/below this percent (respects the heal cooldown).
 SELF_HEAL_THRESHOLD  = 70.0
 # Emergency: heal self immediately, jumping the party rotation, at/below this percent.
@@ -515,6 +517,7 @@ def healer_loop(
     party_reactive_enabled_param=False,
     party_member_vks_param=None,
     party_heal_threshold_param=PARTY_HEAL_THRESHOLD,
+    party_panic_threshold_param=PARTY_PANIC_THRESHOLD,
     party_red_min_param=PARTY_RED_MIN,
     party_red_margin_param=PARTY_RED_MARGIN,
 ):
@@ -538,7 +541,7 @@ def healer_loop(
     else:
         print("        Reactive Self-Heal: OFF")
     if party_reactive_enabled_param:
-        print(f"        Reactive Party Heal: ON  Members={len(party_member_vks_param or [])}  Heal<={party_heal_threshold_param:.0f}%")
+        print(f"        Reactive Party Heal: ON  Members={len(party_member_vks_param or [])}  Heal<={party_heal_threshold_param:.0f}%  Panic<={party_panic_threshold_param:.0f}%")
     else:
         print("        Reactive Party Heal: OFF")
     print("        Press F8 to stop.\n")
@@ -561,6 +564,31 @@ def healer_loop(
 
         # ── Reactive self-heal: highest priority ──────────────────────────────
         # Read our own HP from the bar fill and heal before running the rotation.
+        # Read each near party member's HP once per cycle (dim/far bars → skipped).
+        party_readings = []  # list of (hp, index, vk)
+        if party_reactive_enabled_param and party_member_vks_param:
+            n = len(party_member_vks_param)
+            for i, vk in enumerate(party_member_vks_param):
+                hp = read_party_member_hp(hwnd, i, n, party_red_min_param, party_red_margin_param)
+                if hp is not None:
+                    party_readings.append((hp, i, vk))
+
+        # Priority 1 — PARTY PANIC: a critically low member is healed immediately,
+        # ignoring the cooldown and ahead of self-heal and normal party heals.
+        if party_readings:
+            critical = [r for r in party_readings if r[0] <= party_panic_threshold_param]
+            if critical:
+                hp_val, i, vk = min(critical)
+                print(f"[PARTY] PANIC member #{i + 1} (VK {vk}) at ~{hp_val:.0f}% "
+                      f"(<= {party_panic_threshold_param:.0f}%). Emergency heal.")
+                if vk != previous_target_vk:
+                    _send_vk(hwnd, vk)
+                    time.sleep(0.2)
+                previous_target_vk = vk
+                cast_heal(hwnd, heal_vk_param, cast_delay_param)
+                continue  # re-check immediately, ignore cooldown
+
+        # Priority 2 — SELF reactive heal (panic ignores cooldown; normal respects it).
         if reactive_enabled_param and hp_band_frac_param:
             hp = detect_hp_bar_fill(
                 hwnd, hp_band_frac_param,
@@ -569,7 +597,6 @@ def healer_loop(
                 now = time.time()
                 below_panic = hp <= self_panic_threshold_param
                 below_heal = hp <= self_heal_threshold_param
-                # Panic ignores the cooldown; normal self-heal respects it.
                 if below_panic or (below_heal and now - last_self_heal_time >= heal_cooldown_param):
                     # Ensure the heal lands on self, not a lingering party target.
                     if previous_target_vk is not None and previous_target_vk != VK_SELF_IN_ROTATION:
@@ -584,20 +611,11 @@ def healer_loop(
                     # Re-check immediately; skip the party rotation this tick.
                     continue
 
+        # Priority 3 — normal party heal: lowest member at/below the heal threshold.
         if party_reactive_enabled_param and party_member_vks_param:
-            # Reactive party heal: read each member's HP bar, heal the lowest one
-            # that is below the threshold. Members whose bars are dim (far/out of
-            # range) read as None and are skipped.
-            n = len(party_member_vks_param)
-            lowest = None  # (hp, index, vk)
-            for i, vk in enumerate(party_member_vks_param):
-                hp = read_party_member_hp(hwnd, i, n, party_red_min_param, party_red_margin_param)
-                if hp is None:
-                    continue
-                if hp <= party_heal_threshold_param and (lowest is None or hp < lowest[0]):
-                    lowest = (hp, i, vk)
-            if lowest is not None:
-                hp_val, i, vk = lowest
+            below = [r for r in party_readings if r[0] <= party_heal_threshold_param]
+            if below:
+                hp_val, i, vk = min(below)
                 print(f"[PARTY] Lowest member #{i + 1} (VK {vk}) at ~{hp_val:.0f}% "
                       f"(<= {party_heal_threshold_param:.0f}%). Targeting and healing.")
                 if vk != previous_target_vk:
@@ -681,6 +699,7 @@ class MacroGUI:
         self.self_heal_in_rotation_var = tk.BooleanVar(value=False) # New variable for self-heal in rotation
         self.party_reactive_enabled_var = tk.BooleanVar(value=False) # Reactive (HP-based) party healing
         self.party_heal_threshold_var = tk.StringVar(value=str(PARTY_HEAL_THRESHOLD))
+        self.party_panic_threshold_var = tk.StringVar(value=str(PARTY_PANIC_THRESHOLD))
         self.cast_delay_var = tk.StringVar(value=str(CAST_DELAY))
         self.heal_key_var = tk.StringVar(value=chr(HEAL_VK))
         
@@ -766,8 +785,10 @@ class MacroGUI:
             text="Reactive Party Heal (read HP bars)",
             variable=self.party_reactive_enabled_var
         ).pack(side="left")
-        ttk.Label(reactive_party_frame, text="Heal below (%):").pack(side="left", padx=(10, 2))
+        ttk.Label(reactive_party_frame, text="Party heal below (%):").pack(side="left", padx=(10, 2))
         ttk.Entry(reactive_party_frame, textvariable=self.party_heal_threshold_var, width=6).pack(side="left")
+        ttk.Label(reactive_party_frame, text="Party panic below (%):").pack(side="left", padx=(10, 2))
+        ttk.Entry(reactive_party_frame, textvariable=self.party_panic_threshold_var, width=6).pack(side="left")
 
         # Frame for Buff Settings
         buff_frame = ttk.LabelFrame(self.master, text="Buff Settings")
@@ -819,9 +840,9 @@ class MacroGUI:
                         variable=self.reactive_enabled_var).grid(
             row=0, column=0, columnspan=4, sticky="w", padx=5, pady=2)
 
-        ttk.Label(reactive_frame, text="Heal below (%):").grid(row=1, column=0, sticky="w", padx=5, pady=2)
+        ttk.Label(reactive_frame, text="Self heal below (%):").grid(row=1, column=0, sticky="w", padx=5, pady=2)
         ttk.Entry(reactive_frame, textvariable=self.self_heal_threshold_var, width=6).grid(row=1, column=1, sticky="w", padx=5, pady=2)
-        ttk.Label(reactive_frame, text="Panic below (%):").grid(row=1, column=2, sticky="w", padx=5, pady=2)
+        ttk.Label(reactive_frame, text="Self panic below (%):").grid(row=1, column=2, sticky="w", padx=5, pady=2)
         ttk.Entry(reactive_frame, textvariable=self.self_panic_threshold_var, width=6).grid(row=1, column=3, sticky="w", padx=5, pady=2)
 
         ttk.Label(reactive_frame, text="Search band (L T R B, 0-1):").grid(row=2, column=0, sticky="w", padx=5, pady=2)
@@ -966,6 +987,7 @@ class MacroGUI:
             "self_heal_in_rotation": self.self_heal_in_rotation_var.get(),
             "party_reactive_enabled": self.party_reactive_enabled_var.get(),
             "party_heal_threshold": self.party_heal_threshold_var.get(),
+            "party_panic_threshold": self.party_panic_threshold_var.get(),
             "cast_delay": self.cast_delay_var.get(),
             "heal_key": self.heal_key_var.get(),
             "heal_cooldown": self.heal_cooldown_var.get(),
@@ -997,6 +1019,7 @@ class MacroGUI:
         setvar(self.self_heal_in_rotation_var, "self_heal_in_rotation")
         setvar(self.party_reactive_enabled_var, "party_reactive_enabled")
         setvar(self.party_heal_threshold_var, "party_heal_threshold")
+        setvar(self.party_panic_threshold_var, "party_panic_threshold")
         setvar(self.cast_delay_var, "cast_delay")
         setvar(self.heal_key_var, "heal_key")
         setvar(self.heal_cooldown_var, "heal_cooldown")
@@ -1157,16 +1180,20 @@ class MacroGUI:
         # Reactive party-heal settings
         party_reactive_enabled = self.party_reactive_enabled_var.get()
         party_heal_threshold = PARTY_HEAL_THRESHOLD
+        party_panic_threshold = PARTY_PANIC_THRESHOLD
         if party_reactive_enabled:
             if not party_member_vks:
                 messagebox.showwarning("Warning", "Reactive Party Heal is on but no party members (F1-F4) are selected.")
                 return
             try:
                 party_heal_threshold = float(self.party_heal_threshold_var.get())
-                if not (0 < party_heal_threshold <= 100):
+                party_panic_threshold = float(self.party_panic_threshold_var.get())
+                if not (0 < party_panic_threshold <= party_heal_threshold <= 100):
                     raise ValueError
             except ValueError:
-                messagebox.showerror("Input Error", "Party heal threshold must be a number in 0-100.")
+                messagebox.showerror(
+                    "Input Error",
+                    "Party thresholds must satisfy 0 < panic <= heal <= 100.")
                 return
 
         stop_event.clear()
@@ -1200,6 +1227,7 @@ class MacroGUI:
                 party_reactive_enabled,
                 party_member_vks if party_reactive_enabled else None,
                 party_heal_threshold,
+                party_panic_threshold,
             ),
             daemon=True
         )

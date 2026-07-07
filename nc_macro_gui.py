@@ -70,15 +70,22 @@ GAME_WINDOW_TITLE = "NIGHT CROWS(2)  "
 HP_REGION_RELATIVE = (60, 945, 250, 970)
 
 # ── Reactive (HP-based) self-healing ──────────────────────────────────────────
-# The player's own HP bar region relative to the window client area:
-# (left, top, right, bottom). Calibrate with the "Test HP Read" button.
-HP_BAR_REGION_RELATIVE = (60, 945, 250, 970)
-# Health-fill color range on PIL's 0-255 HSV Hue scale. Defaults target a red bar.
-# Red sits near hue 0, so if HUE_LO > HUE_HI the range wraps past 255→0.
+# Search band to look for the HP bar in, as fractions (0-1) of the window client
+# area: (left, top, right, bottom). Because it is relative, calibration survives
+# window resizing. It only needs to loosely contain the HP bar.
+HP_SEARCH_BAND_FRAC = (0.03, 0.90, 0.30, 0.99)
+# Health-fill color on PIL's 0-255 HSV Hue scale. If LO > HI the range wraps past
+# 255→0 (red sits near hue 0). Only the color is tuned — the bar is auto-located.
 HP_FILL_HUE_LO  = 240
 HP_FILL_HUE_HI  = 12
 HP_FILL_SAT_MIN = 80
 HP_FILL_VAL_MIN = 60
+# The drained/empty part of the bar: a dark, desaturated "track". Detecting it lets
+# us measure the bar's full width, so fill% = filled / (filled + empty).
+HP_TRACK_SAT_MAX = 70
+HP_TRACK_VAL_MAX = 110
+# The detected bar must span at least this fraction of the search-band width.
+HP_MIN_BAR_FRAC = 0.25
 # Heal self when HP drops to/below this percent (respects the heal cooldown).
 SELF_HEAL_THRESHOLD  = 70.0
 # Emergency: heal self immediately, jumping the party rotation, at/below this percent.
@@ -306,43 +313,110 @@ def read_hp_percent(hwnd, save_debug=False):
     return None
 
 
-def read_hp_percent_by_fill(hwnd, bar_region, hue_lo, hue_hi,
-                            sat_min=HP_FILL_SAT_MIN, val_min=HP_FILL_VAL_MIN,
-                            save_debug=False):
-    """Estimate HP% by measuring how much of the bar is filled with the health
-    color, instead of OCR-ing the HP number. This is far more robust against
-    lighting changes, anti-aliasing, and small pixel drift.
+def _frac_to_bbox(hwnd, band_frac):
+    """Convert a fractional (L, T, R, B) band into an absolute screen bbox using
+    the live window client size, so it scales with the window."""
+    rect = get_window_rect(hwnd)
+    if not rect:
+        return None
+    w = rect[2] - rect[0]
+    h = rect[3] - rect[1]
+    return (
+        rect[0] + int(band_frac[0] * w),
+        rect[1] + int(band_frac[1] * h),
+        rect[0] + int(band_frac[2] * w),
+        rect[1] + int(band_frac[3] * h),
+    )
 
-    hue/sat/val are on PIL's 0-255 HSV scale. If hue_lo > hue_hi the hue range
-    is treated as wrapping past 255→0 (needed for red bars near hue 0).
-    Returns a float 0-100, or None on failure.
+
+def _widest_true_run(flags):
+    """Return (start, length) of the widest contiguous True run in a 1-D array."""
+    best_start = best_len = cur_start = cur_len = 0
+    for i, on in enumerate(flags):
+        if on:
+            if cur_len == 0:
+                cur_start = i
+            cur_len += 1
+            if cur_len > best_len:
+                best_len, best_start = cur_len, cur_start
+        else:
+            cur_len = 0
+    return best_start, best_len
+
+
+def detect_hp_bar_fill(hwnd, band_frac, hue_lo, hue_hi,
+                       fill_sat_min=HP_FILL_SAT_MIN, fill_val_min=HP_FILL_VAL_MIN,
+                       track_sat_max=HP_TRACK_SAT_MAX, track_val_max=HP_TRACK_VAL_MAX,
+                       min_bar_frac=HP_MIN_BAR_FRAC, save_debug=False):
+    """Auto-locate the HP bar within a search band and return its fill %.
+
+    The bar is found as the widest contiguous horizontal run of pixels that are
+    either the health fill-color OR the dark empty-track color. HP% is then the
+    fraction of that run that is filled. `band_frac` is (L, T, R, B) as fractions
+    of the window client area, so it is resolution/size independent.
+
+    All color values use PIL's 0-255 HSV scale. If hue_lo > hue_hi the hue range
+    wraps past 255→0 (needed for red bars near hue 0). Returns float 0-100, or
+    None if no bar-like structure is found.
     """
     try:
-        bbox = get_absolute_bbox(hwnd, bar_region)
+        bbox = _frac_to_bbox(hwnd, band_frac)
         if not bbox:
             return None
         img = ImageGrab.grab(bbox=bbox, all_screens=True).convert("HSV")
         arr = np.asarray(img)
-        h, s, v = arr[..., 0], arr[..., 1], arr[..., 2]
+        H, S, V = arr[..., 0], arr[..., 1], arr[..., 2]
 
         if hue_lo <= hue_hi:
-            hue_mask = (h >= hue_lo) & (h <= hue_hi)
+            hue_mask = (H >= hue_lo) & (H <= hue_hi)
         else:  # wrap-around (e.g. red: 240..255 or 0..12)
-            hue_mask = (h >= hue_lo) | (h <= hue_hi)
-        mask = hue_mask & (s >= sat_min) & (v >= val_min)
+            hue_mask = (H >= hue_lo) | (H <= hue_hi)
+        fill = hue_mask & (S >= fill_sat_min) & (V >= fill_val_min)
+        track = (S <= track_sat_max) & (V <= track_val_max)
+        bar = fill | track
 
-        # Collapse to columns: a column is "filled" if most of its pixels match.
-        # Bars drain left-to-right, so the filled-column fraction is the HP%.
-        col_filled = mask.mean(axis=0) > 0.5
-        if col_filled.size == 0:
+        h, w = bar.shape
+        if w == 0 or h == 0:
             return None
 
-        if save_debug:
-            Image.fromarray((mask * 255).astype("uint8")).save("debug_hp_fill.png")
+        # Vertical: the row with the most fill pixels anchors the bar; expand to
+        # neighbouring rows that still have strong fill coverage.
+        fill_rows = fill.sum(axis=1)
+        if fill_rows.max() < min_bar_frac * w:
+            return None  # no health-colored row → no readable bar
+        cy = int(fill_rows.argmax())
+        thr = 0.4 * fill_rows[cy]
+        y0 = cy
+        while y0 > 0 and fill_rows[y0 - 1] >= thr:
+            y0 -= 1
+        y1 = cy
+        while y1 < h - 1 and fill_rows[y1 + 1] >= thr:
+            y1 += 1
 
-        return 100.0 * float(col_filled.sum()) / float(col_filled.size)
+        # Horizontal: within the bar's rows, the full bar is the widest run of
+        # columns that are mostly (fill|track). Filled columns within it give HP%.
+        bar_band = bar[y0:y1 + 1, :]
+        fill_band = fill[y0:y1 + 1, :]
+        col_is_bar = bar_band.mean(axis=0) > 0.5
+        x0, bar_len = _widest_true_run(col_is_bar)
+        if bar_len < min_bar_frac * w:
+            return None
+        x1 = x0 + bar_len - 1
+
+        fill_cols = int((fill_band[:, x0:x1 + 1].mean(axis=0) > 0.5).sum())
+        hp = 100.0 * float(fill_cols) / float(bar_len)
+
+        if save_debug:
+            vis = np.zeros((h, w, 3), dtype=np.uint8)
+            vis[track] = (60, 60, 60)
+            vis[fill] = (220, 30, 30)
+            vis[y0:y1 + 1, x0] = (0, 255, 0)   # detected bar left edge
+            vis[y0:y1 + 1, x1] = (0, 255, 0)   # detected bar right edge
+            Image.fromarray(vis, "RGB").save("debug_hp_fill.png")
+
+        return hp
     except Exception as e:
-        print(f"[HP_READ] Fill read failed: {e}")
+        print(f"[HP_READ] Auto-detect failed: {e}")
         return None
 
 
@@ -378,7 +452,7 @@ def healer_loop(
     buff_keys_param=None,
     buff_interval_param=300,
     reactive_enabled_param=False,
-    hp_bar_region_param=None,
+    hp_band_frac_param=None,
     hp_fill_hue_lo_param=HP_FILL_HUE_LO,
     hp_fill_hue_hi_param=HP_FILL_HUE_HI,
     self_heal_threshold_param=SELF_HEAL_THRESHOLD,
@@ -423,9 +497,9 @@ def healer_loop(
 
         # ── Reactive self-heal: highest priority ──────────────────────────────
         # Read our own HP from the bar fill and heal before running the rotation.
-        if reactive_enabled_param and hp_bar_region_param:
-            hp = read_hp_percent_by_fill(
-                hwnd, hp_bar_region_param,
+        if reactive_enabled_param and hp_band_frac_param:
+            hp = detect_hp_bar_fill(
+                hwnd, hp_band_frac_param,
                 hp_fill_hue_lo_param, hp_fill_hue_hi_param)
             if hp is not None:
                 now = time.time()
@@ -525,10 +599,10 @@ class MacroGUI:
         self.reactive_enabled_var = tk.BooleanVar(value=False)
         self.self_heal_threshold_var = tk.StringVar(value=str(SELF_HEAL_THRESHOLD))
         self.self_panic_threshold_var = tk.StringVar(value=str(SELF_PANIC_THRESHOLD))
-        self.hp_bar_left_var = tk.StringVar(value=str(HP_BAR_REGION_RELATIVE[0]))
-        self.hp_bar_top_var = tk.StringVar(value=str(HP_BAR_REGION_RELATIVE[1]))
-        self.hp_bar_right_var = tk.StringVar(value=str(HP_BAR_REGION_RELATIVE[2]))
-        self.hp_bar_bottom_var = tk.StringVar(value=str(HP_BAR_REGION_RELATIVE[3]))
+        self.hp_band_l_var = tk.StringVar(value=str(HP_SEARCH_BAND_FRAC[0]))
+        self.hp_band_t_var = tk.StringVar(value=str(HP_SEARCH_BAND_FRAC[1]))
+        self.hp_band_r_var = tk.StringVar(value=str(HP_SEARCH_BAND_FRAC[2]))
+        self.hp_band_b_var = tk.StringVar(value=str(HP_SEARCH_BAND_FRAC[3]))
         self.hp_hue_lo_var = tk.StringVar(value=str(HP_FILL_HUE_LO))
         self.hp_hue_hi_var = tk.StringVar(value=str(HP_FILL_HUE_HI))
 
@@ -633,10 +707,10 @@ class MacroGUI:
         ttk.Label(reactive_frame, text="Panic below (%):").grid(row=1, column=2, sticky="w", padx=5, pady=2)
         ttk.Entry(reactive_frame, textvariable=self.self_panic_threshold_var, width=6).grid(row=1, column=3, sticky="w", padx=5, pady=2)
 
-        ttk.Label(reactive_frame, text="HP bar region (L T R B):").grid(row=2, column=0, sticky="w", padx=5, pady=2)
+        ttk.Label(reactive_frame, text="Search band (L T R B, 0-1):").grid(row=2, column=0, sticky="w", padx=5, pady=2)
         region_frame = ttk.Frame(reactive_frame)
         region_frame.grid(row=2, column=1, columnspan=3, sticky="w", padx=5, pady=2)
-        for var in (self.hp_bar_left_var, self.hp_bar_top_var, self.hp_bar_right_var, self.hp_bar_bottom_var):
+        for var in (self.hp_band_l_var, self.hp_band_t_var, self.hp_band_r_var, self.hp_band_b_var):
             ttk.Entry(region_frame, textvariable=var, width=6).pack(side="left", padx=2)
 
         ttk.Label(reactive_frame, text="Health hue lo/hi (0-255):").grid(row=3, column=0, sticky="w", padx=5, pady=2)
@@ -668,17 +742,23 @@ class MacroGUI:
         self.log_text.delete("1.0", "end")
         self.log_text.config(state="disabled")
 
-    def _get_hp_bar_region(self):
-        """Parse the four HP-bar-region entries into an (L, T, R, B) tuple, or None."""
+    def _get_search_band(self):
+        """Parse the four search-band entries into an (L, T, R, B) fraction tuple.
+        Returns None if not four numbers in 0-1 with left<right and top<bottom."""
         try:
-            return (
-                int(self.hp_bar_left_var.get()),
-                int(self.hp_bar_top_var.get()),
-                int(self.hp_bar_right_var.get()),
-                int(self.hp_bar_bottom_var.get()),
+            band = (
+                float(self.hp_band_l_var.get()),
+                float(self.hp_band_t_var.get()),
+                float(self.hp_band_r_var.get()),
+                float(self.hp_band_b_var.get()),
             )
         except ValueError:
             return None
+        if not all(0.0 <= f <= 1.0 for f in band):
+            return None
+        if band[0] >= band[2] or band[1] >= band[3]:
+            return None
+        return band
 
     def _get_hue_range(self):
         """Parse the hue lo/hi entries into ints, or None."""
@@ -698,19 +778,21 @@ class MacroGUI:
         if not hwnd:
             messagebox.showerror("Error", "Game window not found.")
             return
-        region = self._get_hp_bar_region()
-        if not region:
-            messagebox.showerror("Error", "HP bar region must be four integers.")
+        band = self._get_search_band()
+        if not band:
+            messagebox.showerror("Error", "Search band must be four numbers in 0-1 (L<R, T<B).")
             return
         hue = self._get_hue_range()
         if not hue:
             messagebox.showerror("Error", "Health hue lo/hi must be integers (0-255).")
             return
-        hp = read_hp_percent_by_fill(hwnd, region, hue[0], hue[1], save_debug=True)
+        hp = detect_hp_bar_fill(hwnd, band, hue[0], hue[1], save_debug=True)
         if hp is None:
-            print("[TEST] HP read returned None — check region/hue. Saved debug_hp_fill.png.")
+            print("[TEST] No HP bar found — check band/hue. See debug_hp_fill.png "
+                  "(red = detected fill, grey = track, green lines = bar edges).")
         else:
-            print(f"[TEST] Self HP ~ {hp:.1f}%  (mask saved to debug_hp_fill.png)")
+            print(f"[TEST] Self HP ~ {hp:.1f}%  (saved debug_hp_fill.png: red=fill, "
+                  "grey=track, green=bar edges)")
 
     def poll_log_queue(self):
         """Drain queued console output into the log panel. Runs on the Tk main
@@ -815,13 +897,13 @@ class MacroGUI:
 
         # Reactive self-heal settings
         reactive_enabled = self.reactive_enabled_var.get()
-        hp_bar_region = self._get_hp_bar_region()
+        hp_band = self._get_search_band()
         hue_range = self._get_hue_range()
         self_heal_threshold = SELF_HEAL_THRESHOLD
         self_panic_threshold = SELF_PANIC_THRESHOLD
         if reactive_enabled:
-            if not hp_bar_region:
-                messagebox.showerror("Input Error", "HP bar region must be four integers.")
+            if not hp_band:
+                messagebox.showerror("Input Error", "Search band must be four numbers in 0-1 (L<R, T<B).")
                 return
             if not hue_range:
                 messagebox.showerror("Input Error", "Health hue lo/hi must be integers (0-255).")
@@ -860,7 +942,7 @@ class MacroGUI:
                 buff_keys,
                 buff_interval,
                 reactive_enabled,
-                hp_bar_region if reactive_enabled else None,
+                hp_band if reactive_enabled else None,
                 hue_range[0] if hue_range else HP_FILL_HUE_LO,
                 hue_range[1] if hue_range else HP_FILL_HUE_HI,
                 self_heal_threshold,

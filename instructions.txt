@@ -1,0 +1,23 @@
+The executable for the Night Crows Auto Healer GUI has been updated with debug logging and is located at:
+`D:\script\dist\nc_macro_gui.exe`
+
+To help diagnose the game window selection issue, please follow these steps:
+
+1.  **Open a Command Prompt:** Navigate to the `D:\script\dist` directory in your command prompt.
+    ```bash
+    cd D:\script\dist
+    ```
+2.  **Run the application from the command prompt:**
+    ```bash
+    nc_macro_gui.exe
+    ```
+    This will open the GUI and also display any debug messages in the command prompt window.
+3.  **Interact with the GUI:**
+    *   Click the "Refresh" button next to the "Select Game Window" dropdown.
+    *   Observe the output in the command prompt. You should see lines starting with "DEBUG: Detected window title:..." and "DEBUG: Windows found for dropdown:...".
+    *   Select a game window from the dropdown.
+    *   Click "Start Script".
+    *   Observe the output in the command prompt. You should see a line starting with "DEBUG: Game window title used in healer_loop:...".
+4.  **Copy and paste the debug output:** Please copy all the debug output from the command prompt and paste it here. This information is crucial for understanding the exact window titles being detected and used by the script.
+
+Once you provide the debug output, I can analyze it to determine why the game window selection is not working as expected.

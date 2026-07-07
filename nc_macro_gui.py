@@ -605,11 +605,12 @@ def healer_loop(
                 hp_val, i, vk = min(critical)
                 print(f"[PARTY] PANIC F{i + 1} (VK {vk}) at ~{hp_val:.0f}% "
                       f"(<= {party_panic_threshold_param:.0f}%). Emergency heal.")
-                # Always re-select the target immediately before casting: anti-AFK
-                # keys during a cooldown can deselect it, and a stale/lost target
-                # makes the heal self-cast.
-                _send_vk(hwnd, vk)
-                time.sleep(0.2)
+                # Target keys TOGGLE in-game: pressing F# when it is already the
+                # target cancels it (then the heal self-casts). So only press when
+                # switching to a new target; otherwise it is already selected.
+                if vk != previous_target_vk:
+                    _send_vk(hwnd, vk)
+                    time.sleep(0.2)
                 previous_target_vk = vk
                 cast_heal(hwnd, heal_vk_param, cast_delay_param)
                 continue  # re-check immediately, ignore cooldown
@@ -629,11 +630,12 @@ def healer_loop(
                 hp_val, i, vk = min(below)
                 print(f"[PARTY] Lowest F{i + 1} (VK {vk}) at ~{hp_val:.0f}% "
                       f"(<= {party_heal_threshold_param:.0f}%). Targeting and healing.")
-                # Always re-select the target immediately before casting: anti-AFK
-                # keys during a cooldown can deselect it, and a stale/lost target
-                # makes the heal self-cast.
-                _send_vk(hwnd, vk)
-                time.sleep(0.2)
+                # Target keys TOGGLE in-game: pressing F# when it is already the
+                # target cancels it (then the heal self-casts). So only press when
+                # switching to a new target; otherwise it is already selected.
+                if vk != previous_target_vk:
+                    _send_vk(hwnd, vk)
+                    time.sleep(0.2)
                 previous_target_vk = vk
                 cast_heal(hwnd, heal_vk_param, cast_delay_param)
                 cooldown_end = time.time() + heal_cooldown_param

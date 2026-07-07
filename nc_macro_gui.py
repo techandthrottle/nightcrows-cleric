@@ -640,6 +640,8 @@ class MacroGUI:
         self.game_window_dropdown.pack(side="left", padx=5, pady=2, fill="x", expand=True)
         self.refresh_windows_button = ttk.Button(game_window_frame, text="Refresh", command=self.populate_game_windows)
         self.refresh_windows_button.pack(side="left", padx=5, pady=2)
+        self.capture_button = ttk.Button(game_window_frame, text="Capture", command=self.capture_screenshot)
+        self.capture_button.pack(side="left", padx=5, pady=2)
 
         # Frame for Party Heal Settings
         party_frame = ttk.LabelFrame(self.master, text="Party Heal Settings")
@@ -750,6 +752,30 @@ class MacroGUI:
         self.log_text.config(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.config(state="disabled")
+
+    def capture_screenshot(self):
+        """Save a full screenshot of the selected game window's client area, for
+        analysis/calibration (e.g. locating party HP bars)."""
+        title = self.game_window_title_var.get()
+        if not title:
+            messagebox.showerror("Error", "Please select a game window first.")
+            return
+        hwnd = find_game_window(title)
+        if not hwnd:
+            messagebox.showerror("Error", "Game window not found.")
+            return
+        rect = get_window_rect(hwnd)
+        if not rect:
+            messagebox.showerror("Error", "Could not get window bounds.")
+            return
+        try:
+            img = ImageGrab.grab(bbox=rect, all_screens=True)
+            fname = time.strftime("game_capture_%Y%m%d_%H%M%S.png")
+            path = os.path.join(_CONFIG_DIR, fname)
+            img.save(path)
+            print(f"[CAPTURE] Saved {img.width}x{img.height} screenshot to {path}")
+        except Exception as e:
+            print(f"[CAPTURE] Failed: {e}")
 
     def _get_search_band(self):
         """Parse the four search-band entries into an (L, T, R, B) fraction tuple.

@@ -13,6 +13,7 @@ dist/
 
 # Debug captures (regenerated at runtime)
 debug_*.png
+game_capture_*.png
 
 # User settings (per-machine, created at runtime)
 nc_macro_config.json

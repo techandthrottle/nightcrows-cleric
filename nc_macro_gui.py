@@ -9,7 +9,7 @@ import pytesseract
 import win32gui
 import win32con
 import win32api
-from PIL import ImageGrab, ImageOps, ImageStat, Image
+from PIL import ImageGrab, ImageOps, ImageStat, Image, ImageDraw
 import numpy as np
 from pynput import keyboard
 from pynput.keyboard import Key
@@ -605,9 +605,11 @@ def healer_loop(
                 hp_val, i, vk = min(critical)
                 print(f"[PARTY] PANIC F{i + 1} (VK {vk}) at ~{hp_val:.0f}% "
                       f"(<= {party_panic_threshold_param:.0f}%). Emergency heal.")
-                if vk != previous_target_vk:
-                    _send_vk(hwnd, vk)
-                    time.sleep(0.2)
+                # Always re-select the target immediately before casting: anti-AFK
+                # keys during a cooldown can deselect it, and a stale/lost target
+                # makes the heal self-cast.
+                _send_vk(hwnd, vk)
+                time.sleep(0.2)
                 previous_target_vk = vk
                 cast_heal(hwnd, heal_vk_param, cast_delay_param)
                 continue  # re-check immediately, ignore cooldown
@@ -627,9 +629,11 @@ def healer_loop(
                 hp_val, i, vk = min(below)
                 print(f"[PARTY] Lowest F{i + 1} (VK {vk}) at ~{hp_val:.0f}% "
                       f"(<= {party_heal_threshold_param:.0f}%). Targeting and healing.")
-                if vk != previous_target_vk:
-                    _send_vk(hwnd, vk)
-                    time.sleep(0.2)
+                # Always re-select the target immediately before casting: anti-AFK
+                # keys during a cooldown can deselect it, and a stale/lost target
+                # makes the heal self-cast.
+                _send_vk(hwnd, vk)
+                time.sleep(0.2)
                 previous_target_vk = vk
                 cast_heal(hwnd, heal_vk_param, cast_delay_param)
                 cooldown_end = time.time() + heal_cooldown_param
@@ -805,6 +809,7 @@ class MacroGUI:
         ttk.Entry(reactive_party_frame2, textvariable=self.party_heal_threshold_var, width=6).pack(side="left")
         ttk.Label(reactive_party_frame2, text="Party panic below (%):").pack(side="left", padx=(10, 2))
         ttk.Entry(reactive_party_frame2, textvariable=self.party_panic_threshold_var, width=6).pack(side="left")
+        ttk.Button(reactive_party_frame2, text="Test Party Read", command=self.test_party_read).pack(side="left", padx=(10, 0))
 
         # Frame for Buff Settings
         buff_frame = ttk.LabelFrame(self.master, text="Buff Settings")
@@ -919,6 +924,50 @@ class MacroGUI:
             print(f"[CAPTURE] Saved {img.width}x{img.height} screenshot to {path}")
         except Exception as e:
             print(f"[CAPTURE] Failed: {e}")
+
+    def test_party_read(self):
+        """Read each selected party member once and save an overlay showing where
+        the detection bands land on the bars, for calibration/diagnosis."""
+        title = self.game_window_title_var.get()
+        if not title:
+            messagebox.showerror("Error", "Please select a game window first.")
+            return
+        hwnd = find_game_window(title)
+        if not hwnd:
+            messagebox.showerror("Error", "Game window not found.")
+            return
+        try:
+            party_size = int(self.party_size_var.get())
+            if not (1 <= party_size <= 4):
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Error", "Party size (bars shown) must be a whole number 1-4.")
+            return
+        selected = [(i, f"F{i + 1}") for i in range(4) if self.f_keys_vars[f"F{i + 1}"].get()]
+        if not selected:
+            messagebox.showwarning("Warning", "No party members (F1-F4) selected.")
+            return
+        for slot, name in selected:
+            hp = read_party_member_hp(hwnd, slot, party_size)
+            label = "FAR/none" if hp is None else f"{hp:.1f}%"
+            print(f"[PARTY TEST] {name} (slot {slot}, party_size {party_size}): {label}")
+        # Overlay: draw every slot's band on a full-window capture.
+        rect = get_window_rect(hwnd)
+        if not rect:
+            return
+        img = ImageGrab.grab(bbox=rect, all_screens=True).convert("RGB")
+        W, H = img.size
+        draw = ImageDraw.Draw(img)
+        sel_slots = {s for s, _ in selected}
+        for slot in range(party_size):
+            l, t, r, b = _party_member_band(slot, party_size)
+            box = (int(l * W), int(t * H), int(r * W), int(b * H))
+            color = (0, 255, 0) if slot in sel_slots else (255, 255, 0)
+            draw.rectangle(box, outline=color, width=2)
+            draw.text((box[0], max(0, box[1] - 12)), f"F{slot + 1}", fill=color)
+        img.save("debug_party.png")
+        print("[PARTY TEST] Saved overlay to debug_party.png "
+              "(green=selected member bands, yellow=other slots).")
 
     def _get_search_band(self):
         """Parse the four search-band entries into an (L, T, R, B) fraction tuple.

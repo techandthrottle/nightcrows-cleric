@@ -83,21 +83,27 @@ HP_SEARCH_BAND_FRAC = (0.045, 0.950, 0.130, 0.963)
 HP_RED_MIN    = 120   # a "filled" pixel needs at least this much red
 HP_RED_MARGIN = 70    # ...and red must exceed green AND blue by at least this much
 
-# ── Reactive party healing (reads party members' HP bars) ─────────────────────
-# Party HP bars form a horizontal, center-anchored row at the bottom-center, above
-# the hotbar. Geometry as fractions of the window client area (calibrated from
-# 1131x594 captures; scales with the window). Bar i center (0-based, left→right,
-# N members) = CENTER_X + (i - (N-1)/2) * SPACING.
+# ── Reactive party healing (auto-detects party members' HP bars) ──────────────
+# Party HP bars form a horizontal, center-anchored row at the bottom-center. Bars
+# are found directly in the pixels each cycle (no manual party size): each bar's
+# left edge is snapped to a fixed centered grid to recover its slot (F1..F4), and
+# the party size N is inferred from the outermost visible bars. Geometry is in
+# fractions of the window client area, so it scales with the window.
 PARTY_BAR_CENTER_X_FRAC = 0.5075   # horizontal center of the whole row (x~574 @1131)
-PARTY_BAR_SPACING_FRAC  = 0.0964   # center-to-center spacing between members (~109px)
+PARTY_BAR_SPACING_FRAC  = 0.0964   # center-to-center spacing between slots (~109px)
 PARTY_BAR_WIDTH_FRAC    = 0.0619   # width of one member's bar (~70px)
 PARTY_BAR_Y_FRAC        = 0.8838   # vertical center of the bars
 PARTY_BAR_HALFH_FRAC    = 0.0090   # half-height of the sampling band
-# Party bars dim when the member is far (out of heal range): near bars are bright
-# red (R~200+), far bars are dim (R~125). A higher red-min than self filters far.
+PARTY_ROW_XL_FRAC       = 0.30     # search span for the whole party row (left)
+PARTY_ROW_XR_FRAC       = 0.70     # search span for the whole party row (right)
+# Near members show bright red bars (R~200+); far members show dim red (R~125).
+# The DIM thresholds detect a bar's presence (near or far) to locate/count it;
+# the BRIGHT thresholds decide whether it is near enough to heal.
+PARTY_DIM_RED_MIN    = 100
+PARTY_DIM_MARGIN     = 50
 PARTY_RED_MIN        = 160
 PARTY_RED_MARGIN     = 70
-PARTY_BAR_MIN_RED_PX = 3       # fewer vivid-red px than this => far/absent => skip
+PARTY_BAR_MIN_RED_PX = 3       # fewer bright-red px than this => far => skip healing
 PARTY_HEAL_THRESHOLD  = 70.0   # heal a member at/below this percent
 PARTY_PANIC_THRESHOLD = 35.0   # emergency: heal a member at/below this immediately,
                                # ignoring cooldown, above self and normal party heals
@@ -401,40 +407,80 @@ def detect_hp_bar_fill(hwnd, band_frac, red_min=HP_RED_MIN, red_margin=HP_RED_MA
         return None
 
 
-def _party_member_band(index, n):
-    """Fractional (L,T,R,B) band for party member `index` (0-based, left→right)
-    in a party of `n`, using the center-anchored bottom-center row geometry."""
-    offset = (index - (n - 1) / 2.0) * PARTY_BAR_SPACING_FRAC
-    cx = PARTY_BAR_CENTER_X_FRAC + offset
-    half_w = PARTY_BAR_WIDTH_FRAC / 2.0
-    return (cx - half_w, PARTY_BAR_Y_FRAC - PARTY_BAR_HALFH_FRAC,
-            cx + half_w, PARTY_BAR_Y_FRAC + PARTY_BAR_HALFH_FRAC)
+_PARTY_VKS = [win32con.VK_F1, win32con.VK_F2, win32con.VK_F3, win32con.VK_F4]
 
 
-def read_party_member_hp(hwnd, index, n, red_min=PARTY_RED_MIN, red_margin=PARTY_RED_MARGIN):
-    """Return party member `index`'s HP% (0-100), or None if the bar is dim/absent
-    (member is far / out of heal range, so should be skipped)."""
+def _column_runs(flags, gap, min_w):
+    """Group True columns of a 1-D boolean array into (start, end) runs, splitting
+    where the gap between True columns exceeds `gap`; drop runs narrower than min_w."""
+    xs = np.flatnonzero(flags)
+    runs = []
+    if xs.size:
+        s = p = int(xs[0])
+        for x in xs[1:]:
+            x = int(x)
+            if x - p > gap:
+                runs.append((s, p))
+                s = x
+            p = x
+        runs.append((s, p))
+    return [(a, b) for a, b in runs if b - a + 1 >= min_w]
+
+
+def detect_party_members(hwnd):
+    """Auto-detect the party HP bars in the bottom-center row.
+
+    Returns a list of dicts {slot, vk, hp} sorted left→right, where `slot` is the
+    0-based party slot (0 = F1), `vk` its target key, and `hp` the fill percent, or
+    None if the bar is dim (member far / out of heal range). No manual party size:
+    each bar's left edge is snapped to the fixed centered grid to recover its slot,
+    and the party size is inferred from the outermost visible bars.
+    """
     try:
-        bbox = _frac_to_bbox(hwnd, _party_member_band(index, n))
-        if not bbox:
-            return None
+        rect = get_window_rect(hwnd)
+        if not rect:
+            return []
+        W = rect[2] - rect[0]
+        H = rect[3] - rect[1]
+        x_off = int(PARTY_ROW_XL_FRAC * W)
+        bbox = (rect[0] + x_off,
+                rect[1] + int((PARTY_BAR_Y_FRAC - PARTY_BAR_HALFH_FRAC) * H),
+                rect[0] + int(PARTY_ROW_XR_FRAC * W),
+                rect[1] + int((PARTY_BAR_Y_FRAC + PARTY_BAR_HALFH_FRAC) * H))
         img = ImageGrab.grab(bbox=bbox, all_screens=True).convert("RGB")
         arr = np.asarray(img).astype(np.int16)
         R, G, B = arr[..., 0], arr[..., 1], arr[..., 2]
-        red = (R >= red_min) & ((R - G) >= red_margin) & ((R - B) >= red_margin)
-        if int(red.sum()) < PARTY_BAR_MIN_RED_PX:
-            return None  # dim/grayed → far → skip
-        col = red.any(axis=0)
-        idx = np.flatnonzero(col)
-        bar_left = int(idx[0])
-        fill_right = int(idx[-1])
-        w = red.shape[1]
-        denom = w - bar_left
-        hp = 100.0 * (fill_right - bar_left + 1) / float(denom) if denom > 0 else 0.0
-        return max(0.0, min(100.0, hp))
+        dim = (R >= PARTY_DIM_RED_MIN) & ((R - G) >= PARTY_DIM_MARGIN) & ((R - B) >= PARTY_DIM_MARGIN)
+        bright = (R >= PARTY_RED_MIN) & ((R - G) >= PARTY_RED_MARGIN) & ((R - B) >= PARTY_RED_MARGIN)
+
+        barw_px = max(1, int(PARTY_BAR_WIDTH_FRAC * W))
+        runs = _column_runs(dim.any(axis=0), gap=max(6, int(0.013 * W)),
+                             min_w=max(3, int(0.004 * W)))
+        if not runs:
+            return []
+
+        half_spacing = PARTY_BAR_SPACING_FRAC / 2.0
+        entries = []  # (a, b, j)
+        for a, b in runs:
+            bar_left = x_off + a  # window x of the bar's left edge
+            slot_center_frac = (bar_left + barw_px / 2.0) / W
+            j = round((slot_center_frac - PARTY_BAR_CENTER_X_FRAC) / half_spacing)
+            entries.append((a, b, j))
+
+        n = max(abs(j) for _, _, j in entries) + 1  # inferred party size
+        members = []
+        for a, b, j in entries:
+            slot = (j + (n - 1)) // 2
+            if slot < 0 or slot >= len(_PARTY_VKS):
+                continue  # only F1-F4 supported
+            near = int(bright[:, a:a + barw_px].sum()) >= PARTY_BAR_MIN_RED_PX
+            hp = max(0.0, min(100.0, 100.0 * min(b - a + 1, barw_px) / barw_px)) if near else None
+            members.append({"slot": slot, "vk": _PARTY_VKS[slot], "hp": hp})
+        members.sort(key=lambda m: m["slot"])
+        return members
     except Exception as e:
-        print(f"[PARTY_READ] member {index} failed: {e}")
-        return None
+        print(f"[PARTY] Detection failed: {e}")
+        return []
 
 
 def diagnose_hp_band(hwnd, band_frac):
@@ -502,12 +548,9 @@ def healer_loop(
     self_heal_threshold_param=SELF_HEAL_THRESHOLD,
     self_panic_threshold_param=SELF_PANIC_THRESHOLD,
     party_reactive_enabled_param=False,
-    party_members_param=None,        # list of (slot_index, vk) to heal; slot 0 = leftmost bar = F1
-    party_size_param=1,              # total bars shown (party size - self); drives positioning
+    party_heal_slots_param=None,     # set of slot indices to heal (0=F1..3=F4); None/empty = all detected
     party_heal_threshold_param=PARTY_HEAL_THRESHOLD,
     party_panic_threshold_param=PARTY_PANIC_THRESHOLD,
-    party_red_min_param=PARTY_RED_MIN,
-    party_red_margin_param=PARTY_RED_MARGIN,
 ):
     global running
     previous_target_vk = None
@@ -527,8 +570,9 @@ def healer_loop(
     else:
         print("        Reactive Self-Heal: OFF")
     if party_reactive_enabled_param:
-        slots = [s + 1 for s, _ in (party_members_param or [])]
-        print(f"        Reactive Party Heal: ON  PartySize={party_size_param}  Healing F{slots}  Heal<={party_heal_threshold_param:.0f}%  Panic<={party_panic_threshold_param:.0f}%")
+        slots = sorted((party_heal_slots_param or set()))
+        who = "F" + str([s + 1 for s in slots]) if slots else "all detected"
+        print(f"        Reactive Party Heal: ON (auto-detect size)  Healing {who}  Heal<={party_heal_threshold_param:.0f}%  Panic<={party_panic_threshold_param:.0f}%")
     else:
         print("        Reactive Party Heal: OFF")
     print("        Press F8 to stop.\n")
@@ -550,16 +594,17 @@ def healer_loop(
             last_buff_press_time = time.time()
 
         # ── Reactive self-heal: highest priority ──────────────────────────────
-        # Read our own HP from the bar fill and heal before running the rotation.
-        # Read HP once per cycle: chosen party members (dim/far → skipped) + self.
-        # Each member is at its fixed slot within the full party_size row, so which
-        # members are healed is independent of the party's total size.
+        # Read HP once per cycle: auto-detected party members (dim/far → skipped)
+        # and self. Party size/positions are detected from the pixels, so nothing
+        # needs to be set when members join or leave.
         party_readings = []  # list of (hp, slot, vk)
-        if party_reactive_enabled_param and party_members_param:
-            for slot, vk in party_members_param:
-                hp = read_party_member_hp(hwnd, slot, party_size_param, party_red_min_param, party_red_margin_param)
-                if hp is not None:
-                    party_readings.append((hp, slot, vk))
+        if party_reactive_enabled_param:
+            for m in detect_party_members(hwnd):
+                if m["hp"] is None:
+                    continue  # far / out of range
+                if party_heal_slots_param and m["slot"] not in party_heal_slots_param:
+                    continue  # not a slot we were asked to heal
+                party_readings.append((m["hp"], m["slot"], m["vk"]))
         self_hp = None
         if reactive_enabled_param and hp_band_frac_param:
             self_hp = detect_hp_bar_fill(hwnd, hp_band_frac_param, hp_red_min_param, hp_red_margin_param)
@@ -610,7 +655,7 @@ def healer_loop(
             continue
 
         # Priority 4 — normal party heal: lowest member at/below the heal threshold.
-        if party_reactive_enabled_param and party_members_param:
+        if party_reactive_enabled_param:
             below = [r for r in party_readings if r[0] <= party_heal_threshold_param]
             if below:
                 hp_val, i, vk = min(below)
@@ -660,7 +705,6 @@ class MacroGUI:
             "F4": tk.BooleanVar(value=False)
         }
         self.party_reactive_enabled_var = tk.BooleanVar(value=False) # Reactive (HP-based) party healing
-        self.party_size_var = tk.StringVar(value="1")  # bars shown = party size minus self
         self.party_heal_threshold_var = tk.StringVar(value=str(PARTY_HEAL_THRESHOLD))
         self.party_panic_threshold_var = tk.StringVar(value=str(PARTY_PANIC_THRESHOLD))
         self.cast_delay_var = tk.StringVar(value=str(CAST_DELAY))
@@ -725,22 +769,19 @@ class MacroGUI:
 
         f_keys_frame = ttk.Frame(party_frame)
         f_keys_frame.pack(anchor="w", padx=5, pady=2)
-        ttk.Label(f_keys_frame, text="Members to heal (F-keys, left→right):").pack(side="left")
+        ttk.Label(f_keys_frame, text="Slots to heal (leave all unchecked = heal everyone):").pack(side="left")
         for text, var in self.f_keys_vars.items():
             ttk.Checkbutton(f_keys_frame, text=text, variable=var).pack(side="left", padx=2)
 
-        # Reactive party heal: read the selected members' HP bars and heal the
-        # lowest below threshold.
+        # Reactive party heal: auto-detects the party bars (size + positions) each
+        # cycle and heals the lowest below threshold.
         reactive_party_frame = ttk.Frame(party_frame)
         reactive_party_frame.pack(anchor="w", padx=5, pady=2)
         ttk.Checkbutton(
             reactive_party_frame,
-            text="Reactive Party Heal (read HP bars)",
+            text="Reactive Party Heal (auto-detects party size)",
             variable=self.party_reactive_enabled_var
         ).pack(side="left")
-        ttk.Label(reactive_party_frame, text="Party size (bars shown):").pack(side="left", padx=(10, 2))
-        ttk.Entry(reactive_party_frame, textvariable=self.party_size_var, width=4).pack(side="left")
-        ttk.Label(reactive_party_frame, text="(= party size - self; F-keys pick who to heal, left→right)").pack(side="left", padx=(4, 0))
 
         reactive_party_frame2 = ttk.Frame(party_frame)
         reactive_party_frame2.pack(anchor="w", padx=5, pady=2)
@@ -865,8 +906,8 @@ class MacroGUI:
             print(f"[CAPTURE] Failed: {e}")
 
     def test_party_read(self):
-        """Read each selected party member once and save an overlay showing where
-        the detection bands land on the bars, for calibration/diagnosis."""
+        """Auto-detect party members once and save an overlay of the detected
+        bars (slot + HP), for calibration/diagnosis."""
         title = self.game_window_title_var.get()
         if not title:
             messagebox.showerror("Error", "Please select a game window first.")
@@ -875,38 +916,31 @@ class MacroGUI:
         if not hwnd:
             messagebox.showerror("Error", "Game window not found.")
             return
-        try:
-            party_size = int(self.party_size_var.get())
-            if not (1 <= party_size <= 4):
-                raise ValueError
-        except ValueError:
-            messagebox.showerror("Error", "Party size (bars shown) must be a whole number 1-4.")
-            return
-        selected = [(i, f"F{i + 1}") for i in range(4) if self.f_keys_vars[f"F{i + 1}"].get()]
-        if not selected:
-            messagebox.showwarning("Warning", "No party members (F1-F4) selected.")
-            return
-        for slot, name in selected:
-            hp = read_party_member_hp(hwnd, slot, party_size)
-            label = "FAR/none" if hp is None else f"{hp:.1f}%"
-            print(f"[PARTY TEST] {name} (slot {slot}, party_size {party_size}): {label}")
-        # Overlay: draw every slot's band on a full-window capture.
+        members = detect_party_members(hwnd)
+        if not members:
+            print("[PARTY TEST] No party bars detected in the bottom-center row.")
+        for m in members:
+            label = "far/skip" if m["hp"] is None else f"{m['hp']:.0f}%"
+            print(f"[PARTY TEST] F{m['slot'] + 1}: {label}")
+        # Overlay: mark each detected bar's slot band on a full-window capture.
         rect = get_window_rect(hwnd)
         if not rect:
             return
         img = ImageGrab.grab(bbox=rect, all_screens=True).convert("RGB")
         W, H = img.size
         draw = ImageDraw.Draw(img)
-        sel_slots = {s for s, _ in selected}
-        for slot in range(party_size):
-            l, t, r, b = _party_member_band(slot, party_size)
-            box = (int(l * W), int(t * H), int(r * W), int(b * H))
-            color = (0, 255, 0) if slot in sel_slots else (255, 255, 0)
+        half_w = PARTY_BAR_WIDTH_FRAC / 2.0
+        for m in members:
+            n = max((mm["slot"] for mm in members), default=0) + 1
+            cx = PARTY_BAR_CENTER_X_FRAC + (m["slot"] - (n - 1) / 2.0) * PARTY_BAR_SPACING_FRAC
+            box = (int((cx - half_w) * W), int((PARTY_BAR_Y_FRAC - PARTY_BAR_HALFH_FRAC) * H),
+                   int((cx + half_w) * W), int((PARTY_BAR_Y_FRAC + PARTY_BAR_HALFH_FRAC) * H))
+            color = (0, 255, 0) if m["hp"] is not None else (255, 255, 0)
             draw.rectangle(box, outline=color, width=2)
-            draw.text((box[0], max(0, box[1] - 12)), f"F{slot + 1}", fill=color)
+            draw.text((box[0], max(0, box[1] - 12)), f"F{m['slot'] + 1}", fill=color)
         img.save("debug_party.png")
         print("[PARTY TEST] Saved overlay to debug_party.png "
-              "(green=selected member bands, yellow=other slots).")
+              "(green=near/healable, yellow=far).")
 
     def _get_search_band(self):
         """Parse the four search-band entries into an (L, T, R, B) fraction tuple.
@@ -988,7 +1022,6 @@ class MacroGUI:
             "game_window_title": self.game_window_title_var.get(),
             "f_keys": {k: v.get() for k, v in self.f_keys_vars.items()},
             "party_reactive_enabled": self.party_reactive_enabled_var.get(),
-            "party_size": self.party_size_var.get(),
             "party_heal_threshold": self.party_heal_threshold_var.get(),
             "party_panic_threshold": self.party_panic_threshold_var.get(),
             "cast_delay": self.cast_delay_var.get(),
@@ -1019,7 +1052,6 @@ class MacroGUI:
             if k in self.f_keys_vars:
                 self.f_keys_vars[k].set(v)
         setvar(self.party_reactive_enabled_var, "party_reactive_enabled")
-        setvar(self.party_size_var, "party_size")
         setvar(self.party_heal_threshold_var, "party_heal_threshold")
         setvar(self.party_panic_threshold_var, "party_panic_threshold")
         setvar(self.cast_delay_var, "cast_delay")
@@ -1108,14 +1140,8 @@ class MacroGUI:
             messagebox.showerror("Input Error", f"Invalid input: {e}")
             return
 
-        # Party members to heal reactively, as (slot_index, vk): slot 0 = leftmost
-        # bar = F1, slot 1 = F2, etc. Independent of the party's total size.
-        party_members = []
-        _f_slot_vk = [("F1", 0, win32con.VK_F1), ("F2", 1, win32con.VK_F2),
-                      ("F3", 2, win32con.VK_F3), ("F4", 3, win32con.VK_F4)]
-        for _name, _slot, _vk in _f_slot_vk:
-            if self.f_keys_vars[_name].get():
-                party_members.append((_slot, _vk))
+        # Slots to heal (0=F1..3=F4). Empty set => heal all auto-detected members.
+        party_heal_slots = {i for i in range(4) if self.f_keys_vars[f"F{i + 1}"].get()}
 
         safe_afk_keys = parse_safe_afk_keys(self.safe_afk_keys_var.get())
         if self.anti_afk_mode_var.get() == "keypress" and not safe_afk_keys:
@@ -1159,29 +1185,11 @@ class MacroGUI:
                     "Thresholds must satisfy 0 < panic <= heal <= 100.")
                 return
 
-        # Reactive party-heal settings
+        # Reactive party-heal settings (party size/positions are auto-detected)
         party_reactive_enabled = self.party_reactive_enabled_var.get()
         party_heal_threshold = PARTY_HEAL_THRESHOLD
         party_panic_threshold = PARTY_PANIC_THRESHOLD
-        party_size = 1
         if party_reactive_enabled:
-            if not party_members:
-                messagebox.showwarning("Warning", "Reactive Party Heal is on but no party members (F1-F4) are selected.")
-                return
-            try:
-                party_size = int(self.party_size_var.get())
-                if not (1 <= party_size <= 4):
-                    raise ValueError
-            except ValueError:
-                messagebox.showerror("Input Error", "Party size (bars shown) must be a whole number 1-4.")
-                return
-            max_slot = max(slot for slot, _ in party_members)
-            if max_slot >= party_size:
-                messagebox.showerror(
-                    "Input Error",
-                    f"You selected F{max_slot + 1} but party size is {party_size}. "
-                    f"Each healed member's slot must be within the party size.")
-                return
             try:
                 party_heal_threshold = float(self.party_heal_threshold_var.get())
                 party_panic_threshold = float(self.party_panic_threshold_var.get())
@@ -1219,8 +1227,7 @@ class MacroGUI:
                 self_heal_threshold,
                 self_panic_threshold,
                 party_reactive_enabled,
-                party_members if party_reactive_enabled else None,
-                party_size,
+                party_heal_slots if party_reactive_enabled else None,
                 party_heal_threshold,
                 party_panic_threshold,
             ),

@@ -12,9 +12,11 @@ buffs and anti-AFK — all against a selected game window, with an in-app debug 
 - **Game window selection** — auto-detects `NIGHT CROWS` windows and lets you pick one.
 - **Reactive self-healing** — reads your own HP bar and heals when it drops below a
   threshold, with a separate **panic** threshold that ignores the cooldown.
-- **Reactive party healing** — reads each party member's HP bar (bottom-center row)
-  and heals the lowest member below the threshold, with its own **panic** threshold.
-  Far/out-of-range members (dimmed bars) are skipped automatically.
+- **Reactive party healing** — auto-detects the party HP bars (bottom-center row),
+  including the party size, and heals the lowest member below the threshold, with
+  its own **panic** threshold. Far/out-of-range members (dimmed bars) are skipped.
+  No manual party-size setting — bars are located from the pixels each cycle, so
+  adding/removing members is handled automatically.
 - **HP detection by color-fill** — instead of fragile OCR, HP is measured from the
   vivid-red fill of the bar within a resolution-independent (fractional) band, so
   calibration survives window resizing.
@@ -62,10 +64,11 @@ scale with the window as long as the game HUD scales with it.
 1. Select your game window and click **Capture** to save a screenshot (for reference).
 2. **Self:** set the search band and Red min/margin, then click **Test HP Read** —
    `debug_hp_fill.png` shows the detected fill vs the band edges.
-3. **Party:** set **Party size (bars shown)** = party members excluding yourself, check
-   which F-keys to heal (leftmost bar = F1, next = F2, …), then click
-   **Test Party Read** — `debug_party.png` overlays each band on the bars.
-4. Adjust until a full bar reads ~100% and the bands sit on the bars.
+3. **Party:** click **Test Party Read** — it auto-detects the bars and
+   `debug_party.png` overlays each detected member (green = near/healable,
+   yellow = far). Optionally check specific F-keys to restrict which slots to heal
+   (leftmost bar = F1); leave all unchecked to heal everyone.
+4. Adjust until a full bar reads ~100% and the detected boxes sit on the bars.
 
 ## Files
 

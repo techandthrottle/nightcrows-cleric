@@ -554,6 +554,7 @@ def healer_loop(
 ):
     global running
     previous_target_vk = None
+    target_missing_cycles = 0  # consecutive cycles our party target wasn't seen near
     last_buff_press_time = time.time()
     last_self_heal_time = 0.0
 
@@ -605,6 +606,22 @@ def healer_loop(
                 if party_heal_slots_param and m["slot"] not in party_heal_slots_param:
                     continue  # not a slot we were asked to heal
                 party_readings.append((m["hp"], m["slot"], m["vk"]))
+
+        # Forget a party target that is no longer near: when a member moves out of
+        # range the game drops the target, but our "already selected" tracking would
+        # stay stuck on it and self-cast on return. Clearing it forces a re-select
+        # (press the key again) next time we heal that member. Debounced by a couple
+        # of cycles so a one-frame detection flicker doesn't trigger a needless
+        # re-press (which would toggle a still-valid target off).
+        if previous_target_vk is not None:
+            if previous_target_vk in {r[2] for r in party_readings}:
+                target_missing_cycles = 0
+            else:
+                target_missing_cycles += 1
+                if target_missing_cycles >= 2:
+                    previous_target_vk = None
+                    target_missing_cycles = 0
+
         self_hp = None
         if reactive_enabled_param and hp_band_frac_param:
             self_hp = detect_hp_bar_fill(hwnd, hp_band_frac_param, hp_red_min_param, hp_red_margin_param)

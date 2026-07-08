@@ -75,7 +75,7 @@ HP_REGION_RELATIVE = (60, 945, 250, 970)
 # Band framing the HP bar, as fractions (0-1) of the window client area:
 # (left, top, right, bottom). Left edge ≈ bar start, right edge ≈ bar end. Because
 # it is relative, calibration survives window resizing (the HUD scales with it).
-# Calibrate with the "Test HP Read" button + debug_hp_fill.png.
+# Set via the Calibrate window (drag a box over your HP bar).
 HP_SEARCH_BAND_FRAC = (0.045, 0.950, 0.130, 0.963)
 # HP fill is vivid RED: red channel bright and clearly dominant over green/blue.
 # Detected by RGB (not hue). White digits (R≈G≈B), the brown background/dark track
@@ -816,8 +816,6 @@ class MacroGUI:
         self.game_window_dropdown.pack(side="left", padx=5, pady=2, fill="x", expand=True)
         self.refresh_windows_button = ttk.Button(game_window_frame, text="Refresh", command=self.populate_game_windows)
         self.refresh_windows_button.pack(side="left", padx=5, pady=2)
-        self.capture_button = ttk.Button(game_window_frame, text="Capture", command=self.capture_screenshot)
-        self.capture_button.pack(side="left", padx=5, pady=2)
         self.calibrate_button = ttk.Button(game_window_frame, text="Calibrate", command=self.open_calibrator)
         self.calibrate_button.pack(side="left", padx=5, pady=2)
 
@@ -847,7 +845,6 @@ class MacroGUI:
         ttk.Entry(reactive_party_frame2, textvariable=self.party_heal_threshold_var, width=6).pack(side="left")
         ttk.Label(reactive_party_frame2, text="Party panic below (%):").pack(side="left", padx=(10, 2))
         ttk.Entry(reactive_party_frame2, textvariable=self.party_panic_threshold_var, width=6).pack(side="left")
-        ttk.Button(reactive_party_frame2, text="Test Party Read", command=self.test_party_read).pack(side="left", padx=(10, 0))
 
         # Frame for Buff Settings
         buff_frame = ttk.LabelFrame(self.master, text="Buff Settings")
@@ -915,8 +912,6 @@ class MacroGUI:
         color_frame.grid(row=3, column=1, columnspan=2, sticky="w", padx=5, pady=2)
         ttk.Entry(color_frame, textvariable=self.hp_red_min_var, width=6).pack(side="left", padx=2)
         ttk.Entry(color_frame, textvariable=self.hp_red_margin_var, width=6).pack(side="left", padx=2)
-        ttk.Button(reactive_frame, text="Test HP Read", command=self.test_hp_read).grid(
-            row=3, column=3, sticky="e", padx=5, pady=2)
 
         # Frame for the in-app debug log (replaces the separate terminal window)
         log_frame = ttk.LabelFrame(self.master, text="Debug Log")
@@ -938,30 +933,6 @@ class MacroGUI:
         self.log_text.config(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.config(state="disabled")
-
-    def capture_screenshot(self):
-        """Save a full screenshot of the selected game window's client area, for
-        analysis/calibration (e.g. locating party HP bars)."""
-        title = self.game_window_title_var.get()
-        if not title:
-            messagebox.showerror("Error", "Please select a game window first.")
-            return
-        hwnd = find_game_window(title)
-        if not hwnd:
-            messagebox.showerror("Error", "Game window not found.")
-            return
-        rect = get_window_rect(hwnd)
-        if not rect:
-            messagebox.showerror("Error", "Could not get window bounds.")
-            return
-        try:
-            img = ImageGrab.grab(bbox=rect, all_screens=True)
-            fname = time.strftime("game_capture_%Y%m%d_%H%M%S.png")
-            path = os.path.join(_CONFIG_DIR, fname)
-            img.save(path)
-            print(f"[CAPTURE] Saved {img.width}x{img.height} screenshot to {path}")
-        except Exception as e:
-            print(f"[CAPTURE] Failed: {e}")
 
     def _show_image_popup(self, image, title, note=""):
         """Show a PIL image (or path) in a preview window, scaled to fit; tiny
@@ -1079,6 +1050,9 @@ class MacroGUI:
         btns = ttk.Frame(top)
         btns.pack(fill="x", padx=6, pady=(0, 6))
         ttk.Button(btns, text="Save & Close", command=lambda: (self.save_config(), top.destroy())).pack(side="right")
+        ttk.Button(btns, text="Test Party Read", command=self.test_party_read).pack(side="left")
+        ttk.Button(btns, text="Test HP Read", command=self.test_hp_read).pack(side="left", padx=(0, 6))
+        ttk.Label(btns, text="Mark a bar, then Test to verify (live) before saving.").pack(side="left", padx=8)
 
     def test_party_read(self):
         """Auto-detect party members once and save an overlay of the detected

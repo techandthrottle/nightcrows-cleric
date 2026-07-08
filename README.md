@@ -24,8 +24,9 @@ buffs and anti-AFK — all against a selected game window, with an in-app debug 
 - **Timed buffs** — presses configured hotbar keys on an interval.
 - **Anti-AFK** — random WASD movement, safe-key presses, or disabled.
 - **Power-saver detection** — wakes a dimmed game window before casting.
-- **Calibration tools** — `Capture` (save a window screenshot), `Test HP Read` and
-  `Test Party Read` (report readings + save annotated overlay images).
+- **Visual calibrator** — a `Calibrate` window where you drag boxes over your HP bar
+  and a party member's HP bar; built-in `Test HP Read` / `Test Party Read` show a
+  live annotated preview so you can verify before saving.
 - **Settings persistence** — all options are saved to `nc_macro_config.json` and
   restored on the next launch.
 - **In-app debug log** — all output is shown inside the GUI (no separate terminal).
@@ -82,9 +83,9 @@ recalibrate once with the visual calibrator:
    position), so it doesn't matter which member you mark or how many are in your
    party; the count and positions are detected automatically at runtime. Click
    **Save & Close**.
-3. Verify: **Test HP Read** (`debug_hp_fill.png`) should show a full self bar reading
-   ~100%; **Test Party Read** (`debug_party.png`) should box each member (green =
-   near/healable, yellow = far) with correct percentages.
+3. Verify (buttons in the Calibrate window): **Test HP Read** pops up the detected
+   self fill (a full bar should read ~100%); **Test Party Read** pops up the party
+   row with each member boxed (green = near/healable, yellow = far) and its percent.
 
 Fine-tuning: the Red min / margin colors rarely need changing (they're the same on
 every resolution). To restrict which party slots are healed, tick specific F-keys

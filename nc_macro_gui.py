@@ -963,6 +963,28 @@ class MacroGUI:
         except Exception as e:
             print(f"[CAPTURE] Failed: {e}")
 
+    def _show_image_popup(self, image, title, note=""):
+        """Show a PIL image (or path) in a preview window, scaled to fit; tiny
+        images are upscaled so they're readable."""
+        try:
+            if isinstance(image, str):
+                image = Image.open(image).convert("RGB")
+            w, h = image.size
+            scale = min(1100.0 / w, 720.0 / h)
+            if w * scale < 480:  # upscale tiny crops (e.g. the HP-fill mask)
+                scale = 480.0 / w
+            disp = image.resize((max(1, int(w * scale)), max(1, int(h * scale))),
+                                 Image.NEAREST if scale > 1 else Image.LANCZOS)
+            top = tk.Toplevel(self.master)
+            top.title(title)
+            if note:
+                ttk.Label(top, text=note, wraplength=disp.width).pack(padx=8, pady=(8, 0))
+            top._preview_photo = ImageTk.PhotoImage(disp)  # keep ref alive on the window
+            ttk.Label(top, image=top._preview_photo).pack(padx=8, pady=8)
+            ttk.Button(top, text="Close", command=top.destroy).pack(pady=(0, 8))
+        except Exception as e:
+            print(f"[PREVIEW] Could not show image: {e}")
+
     def _party_geom(self):
         """Build the party bar geometry override from the GUI fields, or None."""
         try:
@@ -1038,14 +1060,17 @@ class MacroGUI:
                 status.config(text=f"Self HP band set: L{fl:.3f} T{ft:.3f} R{fr:.3f} B{fb:.3f}")
                 print(f"[CALIBRATE] Self HP band set to ({fl:.4f}, {ft:.4f}, {fr:.4f}, {fb:.4f}).")
             else:
+                # Only the bar's WIDTH and vertical position matter — every member's
+                # bar is identical in size/height, and the row is centered — so it
+                # does not matter which member you mark or how many you have. The
+                # horizontal center is left at its (screen-centered) default.
                 self.party_bar_width_var.set(round(fr - fl, 4))
                 self.party_bar_y_var.set(round((ft + fb) / 2, 4))
                 self.party_bar_halfh_var.set(round(max((fb - ft) / 2, 0.004), 4))
-                self.party_center_x_var.set(round((fl + fr) / 2, 4))
                 status.config(text=f"Party bar set: width {fr - fl:.3f}, y {(ft + fb) / 2:.3f} "
-                                   f"(mark a centered/only member for best center).")
+                                   f"(mark any member — count/position handled automatically).")
                 print(f"[CALIBRATE] Party bar: width={fr - fl:.4f} y={(ft + fb) / 2:.4f} "
-                      f"center={(fl + fr) / 2:.4f}.")
+                      f"(center kept at default; any member/size is fine).")
 
         canvas.bind("<Button-1>", on_down)
         canvas.bind("<B1-Motion>", on_drag)
@@ -1093,6 +1118,19 @@ class MacroGUI:
         img.save("debug_party.png")
         print("[PARTY TEST] Saved overlay to debug_party.png "
               "(green=near/healable, yellow=far).")
+        # Preview: crop to the party row (with margin) so the boxes are visible.
+        cx0 = int(max(0.0, g["xl"] - 0.03) * W)
+        cx1 = int(min(1.0, g["xr"] + 0.03) * W)
+        cy0 = int(max(0.0, g["y"] - 0.06) * H)
+        cy1 = int(min(1.0, g["y"] + 0.06) * H)
+        crop = img.crop((cx0, cy0, cx1, cy1))
+        if not members:
+            summ = "No party bars detected."
+        else:
+            summ = "  ".join(f"F{m['slot']+1}=" + ("far" if m["hp"] is None else f"{m['hp']:.0f}%")
+                             for m in members)
+        self._show_image_popup(crop, "Test Party Read",
+                               note=f"{summ}\ngreen = near/healable,  yellow = far")
 
     def _get_search_band(self):
         """Parse the four search-band entries into an (L, T, R, B) fraction tuple.
@@ -1143,13 +1181,12 @@ class MacroGUI:
             messagebox.showerror("Error", "Red min / Dark max must be integers (0-255).")
             return
         hp = detect_hp_bar_fill(hwnd, band, color[0], color[1], save_debug=True)
-        legend = "(debug_hp_fill.png: red=detected fill, green=band ends, yellow=HP level)"
-        if hp is None:
-            print(f"[TEST] No HP bar found — check band/hue. {legend}")
-        else:
-            print(f"[TEST] Self HP ~ {hp:.1f}%  {legend}")
+        legend = "red = detected fill,  green = band ends,  yellow = HP level"
+        summary = "No HP bar found — check band/colors." if hp is None else f"Self HP ~ {hp:.1f}%"
+        print(f"[TEST] {summary}  ({legend})")
         # Always capture raw pixels + color profile to guide calibration.
         diagnose_hp_band(hwnd, band)
+        self._show_image_popup("debug_hp_fill.png", "Test HP Read", note=f"{summary}\n{legend}")
 
     def poll_log_queue(self):
         """Drain queued console output into the log panel. Runs on the Tk main

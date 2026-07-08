@@ -77,9 +77,11 @@ recalibrate once with the visual calibrator:
 
 1. Select your game window and click **Calibrate**. A screenshot of your window opens.
 2. With **My HP bar** selected, **drag a box around your own HP bar** (left edge to
-   right edge). Then choose **A party member's HP bar** and drag a box around one
-   party member's HP bar (for the most accurate center, do this with a single party
-   member so their bar is centered). Click **Save & Close**.
+   right edge). Then choose **A party member's HP bar** and drag a box around *any
+   one* party member's HP bar — only its width and height are read (not its
+   position), so it doesn't matter which member you mark or how many are in your
+   party; the count and positions are detected automatically at runtime. Click
+   **Save & Close**.
 3. Verify: **Test HP Read** (`debug_hp_fill.png`) should show a full self bar reading
    ~100%; **Test Party Read** (`debug_party.png`) should box each member (green =
    near/healable, yellow = far) with correct percentages.

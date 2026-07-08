@@ -72,9 +72,12 @@ The built app is written to `dist\Revolt.exe` (windowed — no console).
 
 ## Calibrating HP detection
 
-Positions are stored as fractions of the window, so calibration transfers to
-different resolutions as long as the game HUD scales with the window. On a new PC,
-recalibrate once with the visual calibrator:
+Positions are stored as fractions of the window, so they transfer across
+resolutions **of the same aspect ratio** (e.g. any 16:9 size) — on such a setup
+the defaults usually work as-is, so just run **Test Party Read** to confirm and
+skip calibration. Recalibrate only if the bars are off (typically a different
+aspect ratio, where the bottom-left HP bar and bottom-center party frame shift
+differently). To recalibrate, use the visual calibrator:
 
 1. Select your game window and click **Calibrate**. A screenshot of your window opens.
 2. With **My HP bar** selected, **drag a box around your own HP bar** (left edge to
@@ -117,5 +120,5 @@ point. Heal priority is: self-panic → party-panic → self-heal → party-heal
 | `find_windows.py` | Lists visible window titles |
 | `read_hp_memory.py` | Experimental memory-read prototype (unused) |
 
-Runtime-generated files (git-ignored): `nc_macro_config.json` (settings),
-`debug_*.png` (calibration images), `game_capture_*.png` (captures).
+Runtime-generated files (git-ignored): `nc_macro_config.json` (settings) and
+`debug_*.png` (calibration preview images).

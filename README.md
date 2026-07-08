@@ -71,17 +71,22 @@ The built app is written to `dist\Revolt.exe` (windowed — no console).
 
 ## Calibrating HP detection
 
-Detection is tuned to a captured window; because the bands are fractional they
-scale with the window as long as the game HUD scales with it.
+Positions are stored as fractions of the window, so calibration transfers to
+different resolutions as long as the game HUD scales with the window. On a new PC,
+recalibrate once with the visual calibrator:
 
-1. Select your game window and click **Capture** to save a screenshot (for reference).
-2. **Self:** set the search band and Red min/margin, then click **Test HP Read** —
-   `debug_hp_fill.png` shows the detected fill vs the band edges.
-3. **Party:** click **Test Party Read** — it auto-detects the bars and
-   `debug_party.png` overlays each detected member (green = near/healable,
-   yellow = far). Optionally check specific F-keys to restrict which slots to heal
-   (leftmost bar = F1); leave all unchecked to heal everyone.
-4. Adjust until a full bar reads ~100% and the detected boxes sit on the bars.
+1. Select your game window and click **Calibrate**. A screenshot of your window opens.
+2. With **My HP bar** selected, **drag a box around your own HP bar** (left edge to
+   right edge). Then choose **A party member's HP bar** and drag a box around one
+   party member's HP bar (for the most accurate center, do this with a single party
+   member so their bar is centered). Click **Save & Close**.
+3. Verify: **Test HP Read** (`debug_hp_fill.png`) should show a full self bar reading
+   ~100%; **Test Party Read** (`debug_party.png`) should box each member (green =
+   near/healable, yellow = far) with correct percentages.
+
+Fine-tuning: the Red min / margin colors rarely need changing (they're the same on
+every resolution). To restrict which party slots are healed, tick specific F-keys
+(leftmost bar = F1); leave all unchecked to heal everyone.
 
 ## Usage
 

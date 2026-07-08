@@ -9,7 +9,7 @@ import pytesseract
 import win32gui
 import win32con
 import win32api
-from PIL import ImageGrab, ImageOps, ImageStat, Image, ImageDraw
+from PIL import ImageGrab, ImageOps, ImageStat, Image, ImageDraw, ImageTk
 import numpy as np
 from pynput import keyboard
 from pynput.keyboard import Key
@@ -94,6 +94,9 @@ PARTY_BAR_SPACING_FRAC  = 0.0964   # center-to-center spacing between slots (~10
 PARTY_BAR_WIDTH_FRAC    = 0.0619   # width of one member's bar (~70px)
 PARTY_BAR_Y_FRAC        = 0.8838   # vertical center of the bars
 PARTY_BAR_HALFH_FRAC    = 0.0090   # half-height of the sampling band
+# Center-to-center spacing is a fixed proportion of the bar width in the UI layout,
+# so calibrating one bar's width also gives the spacing (spacing = width * ratio).
+PARTY_SPACING_WIDTH_RATIO = PARTY_BAR_SPACING_FRAC / PARTY_BAR_WIDTH_FRAC
 PARTY_ROW_XL_FRAC       = 0.30     # search span for the whole party row (left)
 PARTY_ROW_XR_FRAC       = 0.70     # search span for the whole party row (right)
 # Near members show bright red bars (R~200+); far members show dim red (R~125).
@@ -432,14 +435,33 @@ def _column_runs(flags, gap, min_w):
     return [(a, b) for a, b in runs if b - a + 1 >= min_w]
 
 
-def detect_party_members(hwnd):
+def _resolve_party_geom(geom):
+    """Merge a partial geometry override with the module defaults and derive the
+    spacing (from width) and search x-range (to cover up to 4 centered slots)."""
+    g = {
+        "center": PARTY_BAR_CENTER_X_FRAC,
+        "width": PARTY_BAR_WIDTH_FRAC,
+        "y": PARTY_BAR_Y_FRAC,
+        "halfh": PARTY_BAR_HALFH_FRAC,
+    }
+    if geom:
+        g.update({k: v for k, v in geom.items() if v is not None})
+    g["spacing"] = g.get("spacing") or g["width"] * PARTY_SPACING_WIDTH_RATIO
+    span = 2.0 * g["spacing"] + g["width"]
+    g["xl"] = max(0.0, g["center"] - span)
+    g["xr"] = min(1.0, g["center"] + span)
+    return g
+
+
+def detect_party_members(hwnd, geom=None):
     """Auto-detect the party HP bars in the bottom-center row.
 
     Returns a list of dicts {slot, vk, hp} sorted left→right, where `slot` is the
     0-based party slot (0 = F1), `vk` its target key, and `hp` the fill percent, or
     None if the bar is dim (member far / out of heal range). No manual party size:
     each bar's left edge is snapped to the fixed centered grid to recover its slot,
-    and the party size is inferred from the outermost visible bars.
+    and the party size is inferred from the outermost visible bars. `geom` overrides
+    the bar geometry (from calibration); defaults to the module constants.
     """
     try:
         rect = get_window_rect(hwnd)
@@ -447,11 +469,12 @@ def detect_party_members(hwnd):
             return []
         W = rect[2] - rect[0]
         H = rect[3] - rect[1]
-        x_off = int(PARTY_ROW_XL_FRAC * W)
+        g = _resolve_party_geom(geom)
+        x_off = int(g["xl"] * W)
         bbox = (rect[0] + x_off,
-                rect[1] + int((PARTY_BAR_Y_FRAC - PARTY_BAR_HALFH_FRAC) * H),
-                rect[0] + int(PARTY_ROW_XR_FRAC * W),
-                rect[1] + int((PARTY_BAR_Y_FRAC + PARTY_BAR_HALFH_FRAC) * H))
+                rect[1] + int((g["y"] - g["halfh"]) * H),
+                rect[0] + int(g["xr"] * W),
+                rect[1] + int((g["y"] + g["halfh"]) * H))
         img = ImageGrab.grab(bbox=bbox, all_screens=True).convert("RGB")
         arr = np.asarray(img).astype(np.int16)
         R, G, B = arr[..., 0], arr[..., 1], arr[..., 2]
@@ -460,7 +483,7 @@ def detect_party_members(hwnd):
         teal = (B >= PARTY_TEAL_B_MIN) & ((B - R) >= PARTY_TEAL_MARGIN) & ((G - R) >= PARTY_TEAL_MARGIN)
         teal_col = teal.any(axis=0)
 
-        barw_px = max(1, int(PARTY_BAR_WIDTH_FRAC * W))
+        barw_px = max(1, int(g["width"] * W))
         runs = _column_runs(dim.any(axis=0), gap=max(6, int(0.013 * W)),
                              min_w=max(3, int(0.004 * W)))
         # Keep only runs that have a teal MP bar under them — a real party member is
@@ -469,12 +492,12 @@ def detect_party_members(hwnd):
         if not runs:
             return []
 
-        half_spacing = PARTY_BAR_SPACING_FRAC / 2.0
+        half_spacing = (g["spacing"] / 2.0) or 1e-6
         entries = []  # (a, b, j)
         for a, b in runs:
             bar_left = x_off + a  # window x of the bar's left edge
             slot_center_frac = (bar_left + barw_px / 2.0) / W
-            j = round((slot_center_frac - PARTY_BAR_CENTER_X_FRAC) / half_spacing)
+            j = round((slot_center_frac - g["center"]) / half_spacing)
             entries.append((a, b, j))
 
         n = max(abs(j) for _, _, j in entries) + 1  # inferred party size
@@ -561,6 +584,7 @@ def healer_loop(
     party_heal_slots_param=None,     # set of slot indices to heal (0=F1..3=F4); None/empty = all detected
     party_heal_threshold_param=PARTY_HEAL_THRESHOLD,
     party_panic_threshold_param=PARTY_PANIC_THRESHOLD,
+    party_geom_param=None,           # calibrated party bar geometry override
 ):
     global running
     previous_target_vk = None
@@ -610,7 +634,7 @@ def healer_loop(
         # needs to be set when members join or leave.
         party_readings = []  # list of (hp, slot, vk)
         if party_reactive_enabled_param:
-            for m in detect_party_members(hwnd):
+            for m in detect_party_members(hwnd, party_geom_param):
                 if m["hp"] is None:
                     continue  # far / out of range
                 if party_heal_slots_param and m["slot"] not in party_heal_slots_param:
@@ -734,6 +758,11 @@ class MacroGUI:
         self.party_reactive_enabled_var = tk.BooleanVar(value=False) # Reactive (HP-based) party healing
         self.party_heal_threshold_var = tk.StringVar(value=str(PARTY_HEAL_THRESHOLD))
         self.party_panic_threshold_var = tk.StringVar(value=str(PARTY_PANIC_THRESHOLD))
+        # Party bar geometry (fractions of the window) — set via the calibrator.
+        self.party_center_x_var = tk.StringVar(value=str(PARTY_BAR_CENTER_X_FRAC))
+        self.party_bar_width_var = tk.StringVar(value=str(PARTY_BAR_WIDTH_FRAC))
+        self.party_bar_y_var = tk.StringVar(value=str(PARTY_BAR_Y_FRAC))
+        self.party_bar_halfh_var = tk.StringVar(value=str(PARTY_BAR_HALFH_FRAC))
         self.cast_delay_var = tk.StringVar(value=str(CAST_DELAY))
         self.heal_key_var = tk.StringVar(value=chr(HEAL_VK))
         
@@ -789,6 +818,8 @@ class MacroGUI:
         self.refresh_windows_button.pack(side="left", padx=5, pady=2)
         self.capture_button = ttk.Button(game_window_frame, text="Capture", command=self.capture_screenshot)
         self.capture_button.pack(side="left", padx=5, pady=2)
+        self.calibrate_button = ttk.Button(game_window_frame, text="Calibrate", command=self.open_calibrator)
+        self.calibrate_button.pack(side="left", padx=5, pady=2)
 
         # Frame for Party Heal Settings
         party_frame = ttk.LabelFrame(self.master, text="Party Heal Settings")
@@ -932,6 +963,98 @@ class MacroGUI:
         except Exception as e:
             print(f"[CAPTURE] Failed: {e}")
 
+    def _party_geom(self):
+        """Build the party bar geometry override from the GUI fields, or None."""
+        try:
+            return {
+                "center": float(self.party_center_x_var.get()),
+                "width": float(self.party_bar_width_var.get()),
+                "y": float(self.party_bar_y_var.get()),
+                "halfh": float(self.party_bar_halfh_var.get()),
+            }
+        except ValueError:
+            return None
+
+    def open_calibrator(self):
+        """Show a screenshot of the game window and let the user drag a box over
+        their own HP bar and one party member's HP bar to set the fractions."""
+        title = self.game_window_title_var.get()
+        if not title:
+            messagebox.showerror("Error", "Please select a game window first.")
+            return
+        hwnd = find_game_window(title)
+        if not hwnd:
+            messagebox.showerror("Error", "Game window not found.")
+            return
+        rect = get_window_rect(hwnd)
+        if not rect:
+            messagebox.showerror("Error", "Could not get window bounds.")
+            return
+        img = ImageGrab.grab(bbox=rect, all_screens=True).convert("RGB")
+        win_w, win_h = img.size
+        scale = min(1.0, 1100.0 / win_w, 750.0 / win_h)
+        disp = img.resize((max(1, int(win_w * scale)), max(1, int(win_h * scale))))
+
+        top = tk.Toplevel(self.master)
+        top.title("Calibrate — drag a box over the bar")
+        mode = tk.StringVar(value="self")
+        bar = ttk.Frame(top)
+        bar.pack(fill="x", padx=6, pady=4)
+        ttk.Label(bar, text="Marking:").pack(side="left")
+        ttk.Radiobutton(bar, text="My HP bar", variable=mode, value="self").pack(side="left", padx=4)
+        ttk.Radiobutton(bar, text="A party member's HP bar", variable=mode, value="party").pack(side="left", padx=4)
+        status = ttk.Label(bar, text="Drag a box around the whole bar (left edge → right edge).")
+        status.pack(side="left", padx=10)
+
+        self._cal_photo = ImageTk.PhotoImage(disp)  # keep a reference
+        canvas = tk.Canvas(top, width=disp.width, height=disp.height, cursor="cross")
+        canvas.pack(padx=6, pady=6)
+        canvas.create_image(0, 0, anchor="nw", image=self._cal_photo)
+        st = {"x0": 0, "y0": 0, "rect": None}
+
+        def on_down(e):
+            st["x0"], st["y0"] = e.x, e.y
+            if st["rect"]:
+                canvas.delete(st["rect"])
+            st["rect"] = canvas.create_rectangle(e.x, e.y, e.x, e.y, outline="#00ff00", width=2)
+
+        def on_drag(e):
+            if st["rect"]:
+                canvas.coords(st["rect"], st["x0"], st["y0"], e.x, e.y)
+
+        def on_up(e):
+            x0, x1 = sorted((st["x0"], e.x))
+            y0, y1 = sorted((st["y0"], e.y))
+            if x1 - x0 < 3 or y1 - y0 < 3:
+                return
+            # display px -> window fractions
+            fl, fr = x0 / scale / win_w, x1 / scale / win_w
+            ft, fb = y0 / scale / win_h, y1 / scale / win_h
+            if mode.get() == "self":
+                self.hp_band_l_var.set(round(fl, 4))
+                self.hp_band_t_var.set(round(ft, 4))
+                self.hp_band_r_var.set(round(fr, 4))
+                self.hp_band_b_var.set(round(fb, 4))
+                status.config(text=f"Self HP band set: L{fl:.3f} T{ft:.3f} R{fr:.3f} B{fb:.3f}")
+                print(f"[CALIBRATE] Self HP band set to ({fl:.4f}, {ft:.4f}, {fr:.4f}, {fb:.4f}).")
+            else:
+                self.party_bar_width_var.set(round(fr - fl, 4))
+                self.party_bar_y_var.set(round((ft + fb) / 2, 4))
+                self.party_bar_halfh_var.set(round(max((fb - ft) / 2, 0.004), 4))
+                self.party_center_x_var.set(round((fl + fr) / 2, 4))
+                status.config(text=f"Party bar set: width {fr - fl:.3f}, y {(ft + fb) / 2:.3f} "
+                                   f"(mark a centered/only member for best center).")
+                print(f"[CALIBRATE] Party bar: width={fr - fl:.4f} y={(ft + fb) / 2:.4f} "
+                      f"center={(fl + fr) / 2:.4f}.")
+
+        canvas.bind("<Button-1>", on_down)
+        canvas.bind("<B1-Motion>", on_drag)
+        canvas.bind("<ButtonRelease-1>", on_up)
+
+        btns = ttk.Frame(top)
+        btns.pack(fill="x", padx=6, pady=(0, 6))
+        ttk.Button(btns, text="Save & Close", command=lambda: (self.save_config(), top.destroy())).pack(side="right")
+
     def test_party_read(self):
         """Auto-detect party members once and save an overlay of the detected
         bars (slot + HP), for calibration/diagnosis."""
@@ -943,7 +1066,8 @@ class MacroGUI:
         if not hwnd:
             messagebox.showerror("Error", "Game window not found.")
             return
-        members = detect_party_members(hwnd)
+        geom = self._party_geom()
+        members = detect_party_members(hwnd, geom)
         if not members:
             print("[PARTY TEST] No party bars detected in the bottom-center row.")
         for m in members:
@@ -953,15 +1077,16 @@ class MacroGUI:
         rect = get_window_rect(hwnd)
         if not rect:
             return
+        g = _resolve_party_geom(geom)
         img = ImageGrab.grab(bbox=rect, all_screens=True).convert("RGB")
         W, H = img.size
         draw = ImageDraw.Draw(img)
-        half_w = PARTY_BAR_WIDTH_FRAC / 2.0
+        half_w = g["width"] / 2.0
         for m in members:
             n = max((mm["slot"] for mm in members), default=0) + 1
-            cx = PARTY_BAR_CENTER_X_FRAC + (m["slot"] - (n - 1) / 2.0) * PARTY_BAR_SPACING_FRAC
-            box = (int((cx - half_w) * W), int((PARTY_BAR_Y_FRAC - PARTY_BAR_HALFH_FRAC) * H),
-                   int((cx + half_w) * W), int((PARTY_BAR_Y_FRAC + PARTY_BAR_HALFH_FRAC) * H))
+            cx = g["center"] + (m["slot"] - (n - 1) / 2.0) * g["spacing"]
+            box = (int((cx - half_w) * W), int((g["y"] - g["halfh"]) * H),
+                   int((cx + half_w) * W), int((g["y"] + g["halfh"]) * H))
             color = (0, 255, 0) if m["hp"] is not None else (255, 255, 0)
             draw.rectangle(box, outline=color, width=2)
             draw.text((box[0], max(0, box[1] - 12)), f"F{m['slot'] + 1}", fill=color)
@@ -1051,6 +1176,10 @@ class MacroGUI:
             "party_reactive_enabled": self.party_reactive_enabled_var.get(),
             "party_heal_threshold": self.party_heal_threshold_var.get(),
             "party_panic_threshold": self.party_panic_threshold_var.get(),
+            "party_center_x": self.party_center_x_var.get(),
+            "party_bar_width": self.party_bar_width_var.get(),
+            "party_bar_y": self.party_bar_y_var.get(),
+            "party_bar_halfh": self.party_bar_halfh_var.get(),
             "cast_delay": self.cast_delay_var.get(),
             "heal_key": self.heal_key_var.get(),
             "heal_cooldown": self.heal_cooldown_var.get(),
@@ -1081,6 +1210,10 @@ class MacroGUI:
         setvar(self.party_reactive_enabled_var, "party_reactive_enabled")
         setvar(self.party_heal_threshold_var, "party_heal_threshold")
         setvar(self.party_panic_threshold_var, "party_panic_threshold")
+        setvar(self.party_center_x_var, "party_center_x")
+        setvar(self.party_bar_width_var, "party_bar_width")
+        setvar(self.party_bar_y_var, "party_bar_y")
+        setvar(self.party_bar_halfh_var, "party_bar_halfh")
         setvar(self.cast_delay_var, "cast_delay")
         setvar(self.heal_key_var, "heal_key")
         setvar(self.heal_cooldown_var, "heal_cooldown")
@@ -1257,6 +1390,7 @@ class MacroGUI:
                 party_heal_slots if party_reactive_enabled else None,
                 party_heal_threshold,
                 party_panic_threshold,
+                self._party_geom(),
             ),
             daemon=True
         )
